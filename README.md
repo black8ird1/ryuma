@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Ryuma" width="170">
+  <img src="assets/banner.png" alt="Ryuma — run any coding agent from a Telegram chat" width="100%">
 </p>
 
 <h1 align="center">Ryuma</h1>
