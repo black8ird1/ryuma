@@ -33,7 +33,7 @@ from agent_gateway.post_turn import (
     extract_post_turn_request,
 )
 from agent_gateway.core import Attachment
-from agent_gateway.media import AlbumBuffer, extract_media, save_path, MediaRef
+from agent_gateway.media import AlbumBuffer, extract_media, outbound_image_paths, save_path, MediaRef
 from agent_gateway.merge_gate import MergeGate, base_branch_from_env
 from agent_gateway.skills import activation_prompt, discover_skills
 from agent_gateway import project as gw_project
@@ -46,7 +46,7 @@ from agent_gateway.worktrees import WorktreeBroker, WorktreePolicy
 # The example project (a private brain hook) is excluded from the shipped edition.
 # Tests that exercise it skip cleanly when it isn't present, so the shared suite
 # stays green both here and in the packaged standalone repo.
-_NC_EXAMPLE = ROOT / "scripts" / "agent_gateway" / "examples" / "ninjaclips" / "brain_hook.py"
+_NC_EXAMPLE = ROOT / "scripts" / "agent_gateway" / "examples" / "private" / "brain_hook.py"
 _has_example = _NC_EXAMPLE.exists()
 
 
@@ -70,6 +70,7 @@ class FakeTelegramClient:
         self.sent = []
         self.edited = []
         self.downloaded = []
+        self.files = []
 
     def send(self, chat_id, text, reply_markup=None):
         self.sent.append((chat_id, text, reply_markup))
@@ -77,6 +78,10 @@ class FakeTelegramClient:
 
     def edit(self, chat_id, message_id, text, reply_markup=None):
         self.edited.append((chat_id, message_id, text, reply_markup))
+
+    def send_file(self, chat_id, path, caption=""):
+        self.files.append((chat_id, str(path), caption))
+        return 100 + len(self.files)
 
     def answer_callback(self, callback_id):
         pass
@@ -371,21 +376,38 @@ class AgentGatewayTests(unittest.TestCase):
         self.assertEqual(len(fake.sent), 1)
         self.assertEqual(fake.sent[0][2], markup)
 
-    def test_feed_is_thinking_only_process_goes_to_panel(self):
+    def test_status_noise_never_reaches_feed_prose_leads_once_flowing(self):
+        # Once prose is flowing the feed is thinking-led: status noise NEVER reaches
+        # it, and an action that lands AFTER prose started stays in the data panel.
         card = LiveCard(backend="claude", mode="write", label="Claude Code")
         for _ in range(6):
             card.update(AgentEvent("status", "session active", backend="claude"))
-        card.update(AgentEvent("tool", "$ git status", backend="claude", data={"category": "cmd"}))
         card.update(AgentEvent("thinking", "the real answer", backend="claude", data={"stream": True}))
+        card.update(AgentEvent("tool", "$ git status", backend="claude", data={"category": "cmd"}))
         live = card.render_live()
-        # thinking is in the feed; process (status/actions) is NOT in the feed
         self.assertIn("the real answer", card.feed)
         self.assertNotIn("session active", card.feed)
-        self.assertNotIn("$ git status", card.feed)
-        # the live action surfaces in the PANEL (the ➡️ now line)
-        self.assertIn("$ git status", live)
+        self.assertNotIn("$ git status", card.feed)  # action AFTER prose → panel only
+        self.assertIn("$ git status", live)           # ...still visible in the ➡️ now line
         self.assertIn("the real answer", live)
-        self.assertNotIn("session active", live)  # pure noise gone entirely
+        self.assertNotIn("session active", live)      # pure noise gone entirely
+
+    def test_action_feed_keeps_a_silent_backend_alive(self):
+        # Codex app-server streams NO reasoning prose and only emits its agent message
+        # at the very end — for minutes the feed would otherwise be a frozen "…thinking".
+        # While no prose has streamed, actions seed the feed so the card visibly moves.
+        card = LiveCard(backend="codex", mode="write", label="Codex CLI")
+        card.update(AgentEvent("status", "session active", backend="codex", data={"phase": "session"}))
+        card.update(AgentEvent("tool", "running: npm test", backend="codex", data={"category": "cmd"}))
+        card.update(AgentEvent("tool", "editing telegram.py", backend="codex", data={"category": "file"}))
+        live = card.render_live()
+        self.assertNotIn("…thinking", live)            # no longer frozen
+        self.assertIn("running: npm test", card.feed)  # actions are the live feed now
+        self.assertIn("editing telegram.py", card.feed)
+        self.assertNotIn("session active", card.feed)  # status noise still excluded
+        # Once prose finally streams, it flows into the SAME feed below the actions.
+        card.update(AgentEvent("thinking", "Here is the result.", backend="codex", data={"stream": True}))
+        self.assertIn("Here is the result.", card.feed)
 
     def test_claude_streams_reasoning_and_answer(self):
         from agent_gateway.backends import _parse_claude_event
@@ -398,6 +420,20 @@ class AgentGatewayTests(unittest.TestCase):
         ev2, _ = _parse_claude_event(ans)
         self.assertTrue(ev2.data.get("stream"))
         self.assertIn("the answer", ev2.text)
+
+    def test_codex_sandbox_grants_extra_writable_roots_when_configured(self):
+        from agent_gateway.backends import CodexAppServerBackend
+        be = CodexAppServerBackend(sandbox="workspace-write")
+        self.assertEqual(be._sandbox_policy(), {"type": "workspaceWrite"})  # default: no holes
+        os.environ["AGENT_GATEWAY_CODEX_WRITABLE_ROOTS"] = "/opt/x/state, /tmp/extra"
+        try:
+            pol = be._sandbox_policy()
+            self.assertEqual(pol["type"], "workspaceWrite")
+            self.assertEqual(pol["writableRoots"], ["/opt/x/state", "/tmp/extra"])
+            # read-only sandboxes are NEVER widened
+            self.assertNotIn("writableRoots", CodexAppServerBackend(sandbox="read-only")._sandbox_policy())
+        finally:
+            del os.environ["AGENT_GATEWAY_CODEX_WRITABLE_ROOTS"]
 
     def test_gateway_prompt_can_skip_system_for_token_savings(self):
         from agent_gateway.backends import _gateway_prompt
@@ -812,6 +848,63 @@ class AgentGatewayTests(unittest.TestCase):
         self.assertEqual(len(flushed), 1)
         self.assertEqual(flushed[0][1], "g2cap")
 
+    def test_outbound_image_paths_detects_explicit_and_fresh_generated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "generated"
+            root.mkdir()
+            explicit = Path(tmp) / "logo.png"
+            explicit.write_bytes(b"png")
+            old = root / "old.png"
+            old.write_bytes(b"old")
+            since = time.time()
+            fresh = root / "fresh.png"
+            fresh.write_bytes(b"fresh")
+            os.utime(old, (since - 20, since - 20))
+            os.utime(fresh, (since + 1, since + 1))
+
+            paths = outbound_image_paths(f"saved at {explicit}", since=since, roots=[root])
+            self.assertEqual(paths, [explicit.resolve(), fresh.resolve()])
+
+    def test_gateway_sends_recent_generated_image_after_final(self):
+        class ImageBackend:
+            capabilities = BackendCapabilities(name="img", label="Image Agent", steering=False)
+
+            def __init__(self, root: Path):
+                self.root = root
+
+            def run(self, turn, emit, stop_event, injections):
+                self.root.mkdir(parents=True, exist_ok=True)
+                (self.root / "dragon.png").write_bytes(b"fake-png")
+                return "Generated the logo."
+
+            def reset(self, chat_id):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "generated"
+            old_env = os.environ.get("AGENT_GATEWAY_GENERATED_IMAGE_ROOTS")
+            old_wt = os.environ.get("AGENT_GATEWAY_AUTO_WORKTREE")
+            os.environ["AGENT_GATEWAY_GENERATED_IMAGE_ROOTS"] = str(root)
+            os.environ["AGENT_GATEWAY_AUTO_WORKTREE"] = "0"
+            try:
+                runtime = GatewayRuntime({"img": ImageBackend(root)}, default_backend="img")
+                app = TelegramGatewayApp(TelegramGatewayConfig(token="1:test", allowed_user_ids={1}), runtime)
+                app.client = FakeTelegramClient()  # type: ignore[assignment]
+                app._submit(1, 1, "make logo", None)
+                self.assertTrue(runtime.wait_for_idle(1, timeout=2))
+                time.sleep(0.1)
+                self.assertEqual(len(app.client.files), 1)
+                self.assertTrue(app.client.files[0][1].endswith("dragon.png"))
+            finally:
+                if old_env is None:
+                    os.environ.pop("AGENT_GATEWAY_GENERATED_IMAGE_ROOTS", None)
+                else:
+                    os.environ["AGENT_GATEWAY_GENERATED_IMAGE_ROOTS"] = old_env
+                if old_wt is None:
+                    os.environ.pop("AGENT_GATEWAY_AUTO_WORKTREE", None)
+                else:
+                    os.environ["AGENT_GATEWAY_AUTO_WORKTREE"] = old_wt
+
     # ---- skill auto-discovery (Phase 2) ----
     def _make_skill(self, base, folder, name, desc):
         d = base / folder
@@ -861,7 +954,7 @@ class AgentGatewayTests(unittest.TestCase):
         for var in ("AGENT_GATEWAY_SYSTEM_PROMPT", "AGENT_GATEWAY_SYSTEM_PROMPT_FILE"):
             os.environ.pop(var, None)
         prompt = gw_project.full_system_prompt()
-        self.assertNotIn("NinjaClips", prompt)
+        self.assertNotIn("ExampleProject", prompt)
         self.assertNotIn("AGENTS.md", prompt)
         # functional contract is always present (it's how the bot works)
         self.assertIn("SUGGEST:", prompt)
@@ -980,7 +1073,7 @@ class AgentGatewayTests(unittest.TestCase):
         self.assertIn("Project context:", prompt)
 
     @unittest.skipUnless(_has_example, "example project excluded from shipped edition")
-    def test_ninjaclips_example_brain_hook_loads_and_injects(self):
+    def test_private_example_brain_hook_loads_and_injects(self):
         hook_file = _NC_EXAMPLE
         os.environ["AGENT_GATEWAY_HOOK"] = f"{hook_file}:make_hook"
         try:
@@ -1564,6 +1657,21 @@ class AgentGatewayTests(unittest.TestCase):
         self.assertIn("AGENT_GATEWAY_UNIT_PREFIX", text)  # unit prefix is templated, not hardcoded
         self.assertIn("AGENT_GATEWAY_SEND_ONLINE_MESSAGE=1", text)
         self.assertIn("--status", text)
+
+    def test_claude_text_delta_is_recoverable_as_writing_stream(self):
+        # The empty-final fallback recovers the answer from text_delta stream events, so
+        # they MUST parse as a 'writing' stream the backend can accumulate. Locks that.
+        import json
+        from agent_gateway.backends import _parse_claude_event
+        line = json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "the recovered answer"}}})
+        event, final = _parse_claude_event(line)
+        self.assertIsNone(final)  # not in final_chunks...
+        self.assertEqual(event.kind, "thinking")
+        self.assertTrue(event.data.get("stream"))
+        self.assertEqual(event.data.get("phase"), "writing")  # ...recovered via the streamed answer
+        self.assertEqual(event.text, "the recovered answer")
 
     def test_codex_app_server_backend_advertises_steering(self):
         from agent_gateway.backends import CodexAppServerBackend, _codex_item_label

@@ -347,11 +347,23 @@ class CodexAppServerBackend:
         )
 
     def _sandbox_policy(self) -> dict:
-        return {
+        policy = {
             "read-only": {"type": "readOnly"},
             "workspace-write": {"type": "workspaceWrite"},
             "danger-full-access": {"type": "dangerFullAccess"},
         }.get(self.sandbox, {"type": "workspaceWrite"})
+        # A write turn runs in an ISOLATED worktree, so workspace-write only grants
+        # writes UNDER that worktree. A path in the MAIN checkout (e.g. a shared
+        # state/brain dir an operator's after-turn ritual records into) stays
+        # read-only and the write fails ("sandbox can't write …"). Opt in by listing
+        # absolute paths in AGENT_GATEWAY_CODEX_WRITABLE_ROOTS — only widens the
+        # workspace-write sandbox, never read-only. Field is the app-server's
+        # camelCase `writableRoots` (verified against codex-cli 0.137).
+        if policy.get("type") == "workspaceWrite":
+            roots = [p.strip() for p in os.environ.get("AGENT_GATEWAY_CODEX_WRITABLE_ROOTS", "").split(",") if p.strip()]
+            if roots:
+                policy = {**policy, "writableRoots": roots}
+        return policy
 
     def _ensure_worker(self, chat_id: int, emit: Emit) -> _AppServerWorker:
         worker = self._workers.get(chat_id)
@@ -624,6 +636,7 @@ class ClaudePrintBackend:
         Never emits the terminal error itself — run() decides heal-or-surface."""
         worker = self._ensure_worker(turn.chat_id, emit, workdir=turn.workdir)
         final_chunks: list[str] = []
+        streamed_answer: list[str] = []  # the answer as it streamed (text_delta) — a fallback
         injected = False
         started = time.time()
         # Flush any output still sitting in the pipe from a prior turn's late/orphan
@@ -669,6 +682,13 @@ class ClaudePrintBackend:
             event, final = parsed
             if event is not None:
                 emit(event)
+                # Keep the streamed ANSWER (text_delta → phase "writing") as a fallback:
+                # the structured final (assistant text / result field) is occasionally
+                # empty (tool-only final message, odd result subtype, worktree pulled
+                # mid-turn), but the user already watched the answer stream — don't throw
+                # it away and show "completed with no text".
+                if event.kind == "thinking" and event.data.get("stream") and event.data.get("phase") == "writing":
+                    streamed_answer.append(event.text)
             if final:
                 final_chunks.append(final)
             if _is_result_event(line):
@@ -679,7 +699,18 @@ class ClaudePrintBackend:
                     final_chunks.extend(self._drain_claude_trailing(worker, emit, deadline=time.time() + self.orphan_drain_sec))
                 self._started.add(turn.chat_id)
                 self._turns[turn.chat_id] = self._turns.get(turn.chat_id, 0) + 1
-                return "\n\n".join(_dedupe_text_chunks(final_chunks)).strip() or "Claude completed with no text.", False, ""
+                text = "\n\n".join(_dedupe_text_chunks(final_chunks)).strip()
+                if not text:
+                    text = "".join(streamed_answer).strip()  # fall back to what already streamed
+                    # Log WHY the structured final was empty so the irregular cause is
+                    # confirmable next time (result subtype / whether any text streamed).
+                    try:
+                        subtype = str((json.loads(line) or {}).get("subtype") or "?")
+                    except Exception:  # noqa: BLE001
+                        subtype = "?"
+                    print(f"claude empty-final fallback: subtype={subtype} recovered={len(text)}c "
+                          f"streamed={bool(streamed_answer)} chunks={len(final_chunks)}", flush=True)
+                return text or "Claude completed with no text.", False, ""
 
     def _dead_worker_stderr(self, worker: "_ClaudeWorker", chat_id: int, fallback: str) -> str:
         # Give the stderr pipe a beat to drain so drift detection sees the message.

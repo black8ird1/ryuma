@@ -46,7 +46,7 @@ from .core import Attachment
 from .formatting import md_to_html, split_message
 from .hooks import load_hook
 from .livestore import LiveStore, bot_id_from_token
-from .media import AlbumBuffer, attachment_for, extract_media, save_path, transcribe, voice_enabled
+from .media import AlbumBuffer, attachment_for, extract_media, outbound_image_paths, save_path, transcribe, voice_enabled
 from .merge_gate import MergeGate
 from .post_turn import PostTurnRunner, extract_post_turn_request
 from .project import brand_emoji, brand_name
@@ -127,6 +127,25 @@ class TelegramClient:
         res = requests.post(f"{self.base}/{method}", json=payload or {}, timeout=35)
         res.raise_for_status()
         return res.json()
+
+    def send_file(self, chat_id: int, path: Path, caption: str = "") -> int | None:
+        """Send a local image/file to Telegram. PNG-like assets go as documents so
+        logo transparency and exact bytes survive Telegram's photo compression."""
+        method = "sendPhoto" if path.suffix.lower() in {".jpg", ".jpeg"} else "sendDocument"
+        field = "photo" if method == "sendPhoto" else "document"
+        data: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption[:1024]
+        with open(path, "rb") as fh:
+            res = requests.post(
+                f"{self.base}/{method}",
+                data=data,
+                files={field: (path.name, fh)},
+                timeout=120,
+            )
+        res.raise_for_status()
+        payload = res.json()
+        return int((payload.get("result") or {}).get("message_id") or 0) or None
 
     def send(self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> int | None:
         # Split long output on natural boundaries; render each chunk as HTML so
@@ -752,6 +771,7 @@ class TelegramGatewayApp:
                 # the last chunk. The data card renders exactly once per turn — it
                 # never folds and never doubles (the old '✅ done' stub is gone).
                 self._resolve_in_place(chat_id, message_id, rendered, reply_markup)
+                self._send_outbound_images(chat_id, event.text, since=turn.created_at)
                 try:
                     self.hook.after_turn(turn, event.text)
                 except Exception:  # noqa: BLE001 - recording must never break the reply.
@@ -831,6 +851,23 @@ class TelegramGatewayApp:
                 self.client.edit(chat_id, message_id or 0, card.render_live())
             except Exception:
                 pass
+
+    def _send_outbound_images(self, chat_id: int, text: str, *, since: float) -> None:
+        """Bridge generated image files from agent tools back into Telegram.
+
+        Backends can either mention an absolute image path in their final answer or
+        rely on the default Codex image-tool directory scan for files created during
+        this turn. Failures are reported as text instead of hiding the final answer.
+        """
+        paths = outbound_image_paths(text, since=since)
+        for path in paths:
+            try:
+                self.client.send_file(chat_id, path, caption=f"Generated image: {path.name}")
+            except Exception as exc:  # noqa: BLE001 - text answer already landed; don't crash the turn.
+                try:
+                    self.client.send(chat_id, f"Generated image is saved at `{path}` but Telegram upload failed: {type(exc).__name__}")
+                except Exception:
+                    pass
 
     def _resolve_in_place(self, chat_id: int, message_id: int | None, rendered: str, reply_markup: dict[str, Any] | None) -> None:
         """Turn the live card into the final answer with NO duplicate card.

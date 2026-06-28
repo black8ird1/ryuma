@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
-UNIT_PREFIX="${AGENT_GATEWAY_UNIT_PREFIX:-agent-gateway}"
+UNIT_PREFIX="${AGENT_GATEWAY_UNIT_PREFIX:-ryuma}"
 SYSTEMD_MODE="${AGENT_GATEWAY_SYSTEMD:-auto}"
 
 mkdir -p scripts/logs state/agent-gateway/runtime

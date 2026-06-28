@@ -10,6 +10,7 @@ the whole point of the universal layer.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,79 @@ from typing import Any, Callable
 import requests
 
 from .core import Attachment
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_IMAGE_PATH_RE = re.compile(r"(?P<path>(?:~|/)[^\s`'\"<>]+\.(?:png|jpg|jpeg|webp|gif))", re.IGNORECASE)
+
+
+def generated_image_roots() -> list[Path]:
+    """Roots where tool-generated images are written.
+
+    The built-in Codex image tool stores assets outside the repo, so the gateway
+    must bridge that tool output back to Telegram itself. Override with
+    AGENT_GATEWAY_GENERATED_IMAGE_ROOTS (os.pathsep-separated) for other agents.
+    """
+    raw = os.environ.get("AGENT_GATEWAY_GENERATED_IMAGE_ROOTS", "").strip()
+    parts = raw.split(os.pathsep) if raw else ["/root/.codex/generated_images", str(Path.home() / ".codex" / "generated_images")]
+    roots: list[Path] = []
+    for part in parts:
+        if not part:
+            continue
+        path = Path(part).expanduser()
+        if path not in roots:
+            roots.append(path)
+    return roots
+
+
+def outbound_image_paths(text: str, *, since: float, max_images: int = 4, roots: list[Path] | None = None) -> list[Path]:
+    """Return image files the transport should send back to Telegram.
+
+    Two neutral signals are supported:
+    1. Explicit absolute/~ image paths in the final answer.
+    2. Fresh tool outputs under generated_image_roots(), modified during this turn.
+
+    This keeps image generation tool results from becoming invisible text-only
+    replies, without teaching the gateway anything product-specific.
+    """
+    if os.environ.get("AGENT_GATEWAY_SEND_GENERATED_IMAGES", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return []
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+        except Exception:
+            return
+        if resolved in seen or resolved.suffix.lower() not in IMAGE_EXTS or not resolved.is_file():
+            return
+        seen.add(resolved)
+        found.append(resolved)
+
+    for match in _IMAGE_PATH_RE.finditer(text or ""):
+        add(Path(match.group("path")))
+
+    search_roots = roots if roots is not None else generated_image_roots()
+    recent: list[tuple[float, Path]] = []
+    threshold = max(0.0, since - 2.0)
+    for root in search_roots:
+        try:
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if path.suffix.lower() not in IMAGE_EXTS:
+                    continue
+                st = path.stat()
+                if st.st_mtime >= threshold:
+                    recent.append((st.st_mtime, path))
+        except Exception:
+            continue
+    for _mtime, path in sorted(recent, reverse=True):
+        add(path)
+        if len(found) >= max_images:
+            break
+    return found[:max_images]
 
 
 def tmp_dir() -> Path:

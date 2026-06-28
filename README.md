@@ -35,3 +35,7 @@ Then open your bot in Telegram and talk to it.
 Each write turn runs in an isolated git worktree and auto-merges back when clean
 (smart-merge). You only get asked when there's a real conflict. Point it at your
 repo with `AGENT_GATEWAY_REPO_ROOT`, or run it from inside the repo.
+
+## License
+
+[Apache-2.0](LICENSE).

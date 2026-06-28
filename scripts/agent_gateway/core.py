@@ -454,6 +454,7 @@ class LiveCard:
     """
 
     _CATEGORY_ATTR = {"cmd": "cmd_count", "file": "file_count", "tool": "tool_count"}
+    _ACTION_ICONS = {"cmd": "⚡", "file": "✏️", "tool": "🔧"}
 
     def __init__(
         self,
@@ -584,6 +585,14 @@ class LiveCard:
         elif event.kind == "tool" and text:
             self.current = text[:120]
             self._timeline_push("act", text[:120])  # waypoint in the flowing stream
+            # Prose-streaming backends (Claude) fill the feed with live thinking, so
+            # actions stay in the data panel (`current`) — the separation above. But a
+            # backend that streams NO reasoning prose (Codex app-server only emits its
+            # agent message at the very end) would otherwise show a frozen "…thinking"
+            # body for minutes while it actually works. Until prose starts flowing,
+            # mirror each action into the feed so the live card visibly progresses.
+            if self.stream_chars == 0:
+                self._feed_mark(self._ACTION_ICONS.get(category, "➡️"), text[:120])
         elif event.kind == "injected" and text:
             self.current = f"📨 {text}"
             self._timeline_push("act", f"📨 {text}"[:120])
