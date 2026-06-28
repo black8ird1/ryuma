@@ -1,7 +1,29 @@
-# 🐉 Ryuma
+<p align="center">
+  <img src="assets/logo.png" alt="Ryuma" width="170">
+</p>
 
-Run any coding agent (Claude Code, Codex, …) from a Telegram chat. Live progress,
-isolated git worktrees per task, auto-merge of clean work, voice + image input.
+<h1 align="center">Ryuma</h1>
+
+<p align="center">
+  Run any coding agent — Claude Code, Codex, and more — straight from a Telegram chat.<br>
+  Live progress, an isolated git worktree per task, auto-merge of clean work, voice + image input.
+</p>
+
+---
+
+## Why
+
+Your coding agent lives on a server. You live on your phone. Ryuma is the bridge:
+message a Telegram bot, watch the agent think and edit in real time, and get clean
+work merged back automatically — no SSH, no laptop required.
+
+## Features
+
+- 🤖 **Any agent** — Claude Code, Codex, or the built-in `mock`. One gateway, swap the backend.
+- 📲 **Telegram-native** — chat, voice notes, and images in; a live streaming thought feed out.
+- 🌿 **Isolated worktrees** — every write turn runs in its own git worktree and auto-merges when clean. You're only asked on a real conflict.
+- 🔒 **Allowlisted** — only the Telegram ids you authorize can drive it.
+- 🧩 **Hooks** — inject your own project context per turn (NoOp by default).
 
 ## Install
 
@@ -9,11 +31,11 @@ isolated git worktrees per task, auto-merge of clean work, voice + image input.
 ./install.sh
 ```
 
-That checks prerequisites and launches the setup wizard. The wizard:
+That checks prerequisites and launches the setup wizard, which:
 
 1. walks you through creating a bot in @BotFather (paste the token),
 2. learns your Telegram id automatically — you just message your bot once,
-3. writes the config, and tells you how to start.
+3. writes the config and tells you how to start.
 
 ## Start
 
