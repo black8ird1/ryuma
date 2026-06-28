@@ -556,7 +556,7 @@ class TelegramGatewayApp:
         if not attachments or workdir is None:
             return attachments
         staged: list[Attachment] = []
-        dest_dir = workdir / ".ninja-inbound"
+        dest_dir = workdir / ".ryuma-inbound"
         for att in attachments:
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)

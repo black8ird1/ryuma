@@ -71,7 +71,7 @@ def _load_factory(spec: str):
     target = target.strip()
     if target.endswith(".py") or "/" in target:
         path = Path(target)
-        mod_spec = importlib.util.spec_from_file_location(f"_ninja_hook_{path.stem}", str(path))
+        mod_spec = importlib.util.spec_from_file_location(f"_ryuma_hook_{path.stem}", str(path))
         if mod_spec is None or mod_spec.loader is None:
             raise ImportError(f"cannot load hook file: {target}")
         module = importlib.util.module_from_spec(mod_spec)

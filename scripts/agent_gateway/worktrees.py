@@ -15,7 +15,7 @@ from .core import AgentTurn, ROOT
 class WorktreePolicy:
     enabled: bool = True
     repo: Path = ROOT
-    root: Path = Path(os.environ.get("AGENT_GATEWAY_WORKTREE_ROOT", str(Path.home() / ".ninja-bot" / "worktrees")))
+    root: Path = Path(os.environ.get("AGENT_GATEWAY_WORKTREE_ROOT", str(Path.home() / ".ryuma" / "worktrees")))
     base: str = "HEAD"
     branch_prefix: str = "agent"
 
@@ -33,7 +33,7 @@ class WorktreePolicy:
         return cls(
             enabled=_env_bool("AGENT_GATEWAY_AUTO_WORKTREE", True),
             repo=Path(os.environ.get("AGENT_GATEWAY_REPO_ROOT", str(ROOT))),
-            root=Path(os.environ.get("AGENT_GATEWAY_WORKTREE_ROOT", str(Path.home() / ".ninja-bot" / "worktrees"))),
+            root=Path(os.environ.get("AGENT_GATEWAY_WORKTREE_ROOT", str(Path.home() / ".ryuma" / "worktrees"))),
             base=base,
             branch_prefix=os.environ.get("AGENT_GATEWAY_BRANCH_PREFIX", "agent").strip() or "agent",
         )

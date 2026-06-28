@@ -363,7 +363,7 @@ class CodexAppServerBackend:
             text=True, bufsize=1,
         )
         worker = _AppServerWorker(proc)
-        worker.request("initialize", {"clientInfo": {"name": "ninja-gateway", "version": "0.1"}}, timeout=20)
+        worker.request("initialize", {"clientInfo": {"name": "ryuma-gateway", "version": "0.1"}}, timeout=20)
         self._workers[chat_id] = worker
         emit(AgentEvent("status", "Codex app-server worker active.", backend="codex", data={"phase": "session"}))
         return worker
