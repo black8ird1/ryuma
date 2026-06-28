@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Ryuma · live</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root{
+    --bg:#0c0d10; --surface:#15171c; --surface2:#1b1e25; --line:#23262e;
+    --ink:#eef1f6; --dim:#8a90a0; --faint:#565c6b; --accent:#ff4d5e; --accent-soft:#ff4d5e22;
+    --good:#46d39a; --info:#5db8ff; --warn:#ffc14d;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Inter","SF Pro Text",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,monospace}
+  #app{display:flex;flex-direction:column;height:100%}
+  /* ── Panel (the stat window) ── */
+  .panel{padding:15px 17px 13px;position:sticky;top:0;z-index:3;background:var(--surface);
+    border-bottom:1px solid var(--line)}
+  .hud{display:flex;align-items:center;gap:9px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 3px var(--accent-soft);animation:beat 1.4s ease-in-out infinite}
+  @keyframes beat{50%{opacity:.4}}
+  .brand{font-weight:700;letter-spacing:-.1px}
+  .label{color:var(--faint);font-weight:500;font-size:13px}
+  .phase{margin-left:auto;color:var(--dim);font-weight:600;font-size:11px;letter-spacing:1.2px;text-transform:uppercase}
+  .gauges{display:flex;flex-wrap:wrap;gap:7px;margin-top:13px}
+  .chip{padding:4px 10px;font-size:12px;font-weight:600;color:var(--dim);background:var(--surface2);
+    border:1px solid var(--line);border-radius:7px}
+  .chip b{color:var(--ink);margin-left:5px;font-weight:700}
+  .chip b.t{color:var(--info)} .chip b.d{color:var(--good)} .chip b.k{color:var(--warn)}
+  .now{margin-top:11px;color:var(--dim);font-size:12px;font-weight:500;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis;min-height:14px}
+  .now b{color:var(--accent);font-weight:600}
+  /* ── Stream (the running commentary) ── */
+  .body{flex:1;overflow-y:auto;padding:16px 17px 28px;scroll-behavior:smooth}
+  #stream{display:flex;flex-direction:column}
+  .ln{animation:rise .22s ease-out}
+  @keyframes rise{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+  /* reasoning — dim, the raw thoughts flowing */
+  .ln.reason{color:var(--dim);font-size:13px;line-height:1.62;white-space:pre-wrap;word-break:break-word;
+    border-left:2px solid var(--line);padding-left:13px;margin:2px 0}
+  .ln.reason b{color:var(--ink)} .ln.reason code{font-family:ui-monospace,monospace;color:var(--warn)}
+  /* answer — bright, the resolved output */
+  .ln.answer{color:var(--ink);font-size:15px;line-height:1.62;white-space:pre-wrap;word-break:break-word;margin:8px 0 2px}
+  .ln.answer b{font-weight:700} .ln.answer i{font-style:italic;color:#cfd5e4}
+  .ln.answer code{font-family:ui-monospace,monospace;background:var(--surface2);color:var(--warn);
+    padding:1.5px 6px;border-radius:5px;font-size:13px}
+  /* action waypoint — punctuates the stream with rhythm */
+  .ln.act{display:flex;align-items:center;gap:8px;margin:9px 0;color:var(--info);font-size:12px;font-weight:600}
+  .ln.act .wp{color:var(--accent);font-weight:800;flex:none}
+  .ln.act .txt{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:11.5px;color:#aeb6c6;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cursor{display:inline-block;width:7px;height:15px;background:var(--accent);vertical-align:-2px;
+    margin-left:2px;border-radius:1px;animation:blink 1.1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .waiting{color:var(--dim);font-size:14px}
+  .foot{padding:9px 17px;border-top:1px solid var(--line);color:var(--faint);font-size:11px;
+    display:flex;align-items:center;gap:7px}
+  .done .dot{animation:none;background:var(--faint);box-shadow:none}
+  .done .cursor{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="panel">
+    <div class="hud"><span class="dot" id="dot"></span><span class="brand" id="brand">Ryuma</span>
+      <span class="label" id="label"></span><span class="phase" id="phase">starting</span></div>
+    <div class="gauges" id="gauges"></div>
+    <div class="now" id="now"></div>
+  </div>
+  <div class="body" id="body">
+    <div id="stream"></div><span class="cursor" id="cursor"></span>
+    <div class="waiting" id="waiting">connecting…</div>
+  </div>
+  <div class="foot"><span class="dot" style="width:6px;height:6px"></span><span id="foot">live</span></div>
+</div>
+<script>
+  try{Telegram.WebApp.ready();Telegram.WebApp.expand();}catch(e){}
+  const qs=new URLSearchParams(location.search), chat=qs.get("chat")||"0", key=qs.get("key")||"", bot=qs.get("bot")||"";
+  const $=(id)=>document.getElementById(id);
+  let atBottom=true, nodes=[], turnId=null;
+  $("body").addEventListener("scroll",()=>{const e=$("body");atBottom=e.scrollHeight-e.scrollTop-e.clientHeight<70;});
+  const esc=(s)=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  function md(t){return esc(t).replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g,"$1<i>$2</i>").replace(/`([^`]+)`/g,"<code>$1</code>");}
+  function chip(l,v,cls){return `<span class="chip">${l}<b class="${cls||''}">${v}</b></span>`;}
+
+  function paintPanel(s){
+    $("label").textContent="· "+(s.label||""); $("phase").textContent=s.phase||"";
+    const g=[chip("⏱",s.clock||"0:00","t")];
+    if(s.diff)g.push(chip("📊",s.diff,"d"));
+    if(s.cmd||s.tool||s.file)g.push(chip("🔁",`${s.cmd||0}c ${s.tool||0}t ${s.file||0}f`));
+    if(s.chars)g.push(chip("📝",s.chars>=1000?(s.chars/1000).toFixed(1)+"k":s.chars));
+    if(s.idle>=15)g.push(chip("⏳",s.idle+"s"));
+    g.push(chip(s.mode==="write"?"✎":"◇",s.mode||"write"));
+    $("gauges").innerHTML=g.join("");
+    $("now").innerHTML=s.done?"":(s.now?"→ <b>"+esc(s.now)+"</b>":"");
+  }
+
+  function paintStream(s){
+    if(s.started_at!==turnId){ turnId=s.started_at; $("stream").innerHTML=""; nodes=[]; }
+    const tl=s.timeline||[];
+    for(let i=0;i<tl.length;i++){
+      const e=tl[i]; let n=nodes[i];
+      if(!n){ n=document.createElement("div"); n.className="ln "+e.t; $("stream").appendChild(n); nodes[i]=n; n._len=-1; }
+      if(n._len!==e.text.length){
+        n.innerHTML = e.t==="act" ? ('<span class="wp">▸</span><span class="txt">'+esc(e.text)+'</span>') : md(e.text);
+        n._len=e.text.length;
+      }
+    }
+    // tail cursor follows the last prose line while live
+    const last=$("stream").lastChild;
+    if(last && last.className.indexOf("act")===-1) last.appendChild($("cursor"));
+    $("cursor").style.display=s.done?"none":"";
+  }
+
+  function render(s){
+    if(!s||!s.label){ $("waiting").textContent="waiting for a turn — send the bot a message."; $("waiting").style.display=""; return; }
+    paintPanel(s);
+    paintStream(s);
+    const has=(s.timeline&&s.timeline.length);
+    $("waiting").style.display=has?"none":"";
+    if(!has)$("waiting").textContent=s.done?"turn complete.":"thinking…";
+    if(atBottom)$("body").scrollTop=$("body").scrollHeight;
+    $("app").classList.toggle("done",!!s.done);
+    $("foot").textContent=s.done?"turn complete":"live · streaming";
+  }
+  async function poll(){try{const r=await fetch(`/state?bot=${encodeURIComponent(bot)}&chat=${encodeURIComponent(chat)}&key=${encodeURIComponent(key)}`,{cache:"no-store"});if(r.ok)render(await r.json());}catch(e){}}
+  poll();setInterval(poll,450);
+</script>
+</body>
+</html>
