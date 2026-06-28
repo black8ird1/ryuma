@@ -45,11 +45,27 @@ scripts/agent_gateway_start.sh <agent>     # e.g. claude or codex
 
 Then open your bot in Telegram and talk to it.
 
+## Agents
+
+You only need **one** agent set up to start. The bot runs every backend, so you
+can add the other later **from your phone** — no re-running setup:
+
+- Send **`/agents`** in the chat to see which agents are installed, get the exact
+  install + sign-in commands for any that aren't, and tap to switch.
+
+Setting up an agent CLI (once, on the host):
+
+| Agent | Install | Sign in |
+|-------|---------|---------|
+| Claude Code | `npm install -g @anthropic-ai/claude-code` | `claude` (or `claude setup-token` for headless) |
+| Codex | `npm install -g @openai/codex` | `codex login` |
+
 ## Requirements
 
 - Python 3.10+
 - git
-- At least one agent CLI on PATH: `claude` or `codex` (or use the built-in `mock`)
+- At least one agent CLI on PATH: `claude` or `codex` (or use the built-in `mock`).
+  Don't have one yet? The wizard sets up with `mock`; add a real agent later with `/agents`.
 - Optional: `GROQ_API_KEY` for voice transcription
 
 ## How it works

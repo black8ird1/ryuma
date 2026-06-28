@@ -28,14 +28,12 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from agent_gateway.agent_setup import KNOWN_AGENTS, agent_status, setup_lines, spec_for
 from agent_gateway.profiles import write_profile_template, write_users_env
 from agent_gateway.project import brand_emoji, brand_name
 
 # BotFather tokens look like 123456789:AA... (numeric id, colon, 35-char secret).
 TOKEN_RE = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{30,}$")
-
-# Agents we know how to drive, in the order we offer them. mock needs no CLI.
-KNOWN_AGENTS = ("claude", "codex")
 
 HttpFn = Callable[[str, str, dict], dict]  # (method, token, params) -> parsed JSON
 
@@ -205,10 +203,28 @@ def run(
     p(f"✓ Captured your id: {user_id}")
 
     # 4. pick agent ---------------------------------------------------------- #
+    # You only need ONE agent set up right now. The bot runs every backend, so the
+    # other(s) can be added later from your phone with /agents — no re-run of setup.
+    p("\nWhich agent should this bot open on?")
+    p("You only need ONE working now — add the rest later from the bot with /agents.\n")
+    for spec, ready in agent_status(which):
+        if ready:
+            p(f"  ✓ {spec.label} ({spec.name}) — installed, ready to use")
+        else:
+            p(f"  ⚙ {spec.label} ({spec.name}) — not installed yet:")
+            for line in setup_lines(spec):
+                p(f"  {line}")
     default_agent = cli_agents[0] if cli_agents else "mock"
-    p(f"\nDefault agent for this bot? {agents}  [{default_agent}]")
+    p(f"\nOptions: {agents}  ·  default [{default_agent}]")
     choice = input_fn(f"Agent [{default_agent}]: ").strip().lower()
     agent = choice if choice in agents else default_agent
+    chosen_spec = spec_for(agent)
+    if chosen_spec and agent not in cli_agents:
+        # They picked an agent whose CLI isn't on PATH yet — let them, but be honest
+        # that it needs install + sign-in before a real task will run.
+        p(f"⚠ {chosen_spec.label} isn't installed yet — set it up before your first task:")
+        for line in setup_lines(chosen_spec):
+            p(f"  {line}")
 
     # 5. write profiles ------------------------------------------------------ #
     write_users_env([user_id])
@@ -222,6 +238,7 @@ def run(
     p("\nSetup complete. 🎉")
     p(f"  Start now:   scripts/agent_gateway_start.sh {profile_name}")
     p(f"  Then message @{username} on Telegram and just talk to it.")
+    p("  Add another agent (Claude / Codex) anytime — just send /agents to your bot.")
     return OnboardResult(profile=profile_name, agent=agent, user_id=user_id, username=username)
 
 

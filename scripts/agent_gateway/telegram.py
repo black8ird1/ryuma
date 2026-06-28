@@ -42,6 +42,7 @@ from .core import (
 )
 from dataclasses import replace
 
+from .agent_setup import agent_status, setup_lines, spec_for
 from .core import Attachment
 from .formatting import md_to_html, split_message
 from .hooks import load_hook
@@ -74,6 +75,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("stop", "Cancel the active run"),
     ("status", "Backend, model, effort"),
     ("model", "Pick agent + model"),
+    ("agents", "Add / switch agent (Claude, Codex)"),
     ("effort", "Set reasoning effort"),
     ("help", "Show help"),
 ]
@@ -340,6 +342,27 @@ class TelegramGatewayApp:
         label = f"{backend} · pick a model:" if models else f"{backend} · type /model <name> (no suggestions)"
         self._send_or_edit(chat_id, label, {"inline_keyboard": rows} if rows else None, message_id)
 
+    def _agents_overview(self, chat_id: int) -> None:
+        """Status board for the agents you can drive: which are installed + ready,
+        which need a one-line install/login, and a tap to switch the current one.
+        This is the in-bot 'set up the other agent' path the wizard points to."""
+        cur = self.runtime.backend_for_chat(chat_id)
+        enabled = set(self.runtime.backend_names())
+        lines = [f"{brand_emoji()} Agents — set up one, add the rest anytime.\n"]
+        rows: list[list[dict[str, str]]] = []
+        for spec, ready in agent_status():
+            here = "  ← current" if spec.name == cur else ""
+            if ready:
+                lines.append(f"✓ {spec.label} ({spec.name}) — ready{here}")
+                if spec.name in enabled and spec.name != cur:
+                    rows.append([{"text": f"Use {spec.label}", "callback_data": f"useag:{spec.name}"}])
+            else:
+                lines.append(f"⚙ {spec.label} ({spec.name}) — not installed yet:")
+                lines.extend(setup_lines(spec))
+        lines.append("\nAfter installing one, send /agents again to switch to it.")
+        self.client.send(chat_id, "\n".join(lines),
+                         reply_markup={"inline_keyboard": rows} if rows else None)
+
     def _broadcast_to_operators(self, text: str) -> None:
         """Send a message to every allowed operator — used by the brain's background
         loop (scheduled alerts/digests) via the start_background seam."""
@@ -449,6 +472,16 @@ class TelegramGatewayApp:
             return
         if data.startswith("build:"):
             self._handle_build(chat_id, user_id, data[6:])
+            return
+        if data.startswith("useag:"):  # /agents board: switch to a ready agent
+            backend = data[6:]
+            spec = spec_for(backend)
+            label = spec.label if spec else backend
+            try:
+                self.runtime.select_backend(chat_id, backend)
+                self._send_or_edit(chat_id, f"✓ Agent → {label}", None, mid)
+            except ValueError as exc:
+                self.client.send(chat_id, str(exc))
             return
         if data.startswith("pa:"):  # picked an agent (or '←' back) in the agent→model tree
             backend = data[3:]
@@ -625,6 +658,9 @@ class TelegramGatewayApp:
         rest = rest.strip()
         if cmd in {"/start", "/help"}:
             self.client.send(chat_id, self._help())
+            return
+        if cmd == "/agents":
+            self._agents_overview(chat_id)
             return
         if cmd in {"/model", "/agent"}:
             # Unified agent→model picker. No arg → the tap-tree; an arg still sets
@@ -990,6 +1026,7 @@ class TelegramGatewayApp:
             "/stop — cancel the run\n"
             "/status — agent · model · effort\n"
             "/model — pick model (tap or type)\n"
+            "/agents — add or switch agent (Claude, Codex)\n"
             "/effort <level> — set effort (e.g. ultra)\n"
             f"{switch}"
             "\nNo /commit or /merge ceremony — it proposes scoped git, you tap to land."

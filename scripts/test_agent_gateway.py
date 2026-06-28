@@ -1795,5 +1795,35 @@ class OnboardTest(unittest.TestCase):
         self.assertIsNone(capture_user_id("tok", http=empty, sleep=lambda s: None, attempts=3))
 
 
+class AgentSetupTest(unittest.TestCase):
+    def test_agent_status_reports_installed(self):
+        from agent_gateway.agent_setup import agent_status
+
+        which = lambda name: "/usr/bin/claude" if name == "claude" else None
+        status = {spec.name: ready for spec, ready in agent_status(which=which)}
+        self.assertTrue(status["claude"])
+        self.assertFalse(status["codex"])
+
+    def test_ready_agents_filters_to_installed(self):
+        from agent_gateway.agent_setup import ready_agents
+
+        self.assertEqual(ready_agents(which=lambda n: "/bin/codex" if n == "codex" else None), ["codex"])
+        self.assertEqual(ready_agents(which=lambda n: None), [])
+
+    def test_spec_for_known_and_unknown(self):
+        from agent_gateway.agent_setup import spec_for
+
+        self.assertEqual(spec_for("claude").bin, "claude")
+        self.assertEqual(spec_for("CODEX").name, "codex")
+        self.assertIsNone(spec_for("mock"))
+
+    def test_setup_lines_carry_install_and_login(self):
+        from agent_gateway.agent_setup import setup_lines, spec_for
+
+        lines = "\n".join(setup_lines(spec_for("codex")))
+        self.assertIn("npm install -g @openai/codex", lines)
+        self.assertIn("codex login", lines)
+
+
 if __name__ == "__main__":
     unittest.main()
