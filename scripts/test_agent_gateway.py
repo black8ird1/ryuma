@@ -11,7 +11,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agent_gateway.backends import ClaudePrintBackend, CodexExecBackend, MockBackend
+from agent_gateway.backends import ClaudePrintBackend, CodexExecBackend, MockBackend, _codex_model_or_default
 from agent_gateway.core import (
     AgentEvent,
     AgentTurn,
@@ -96,6 +96,9 @@ class FakeTelegramClient:
         Path(dest).write_bytes(b"fake-bytes")
         self.downloaded.append((file_path, str(dest)))
 
+    def chat_action(self, chat_id, action="typing"):
+        pass
+
 
 class AgentGatewayTests(unittest.TestCase):
     def test_interface_report_captures_best_features(self):
@@ -173,6 +176,31 @@ class AgentGatewayTests(unittest.TestCase):
 
         self.assertEqual(runtime.backend_for_chat(10), "mock")
         self.assertIn("Fixed agent: mock", fake.sent[-1][1])
+
+    def test_fixed_profile_forces_default_backend_for_turns(self):
+        runtime = GatewayRuntime({"mock": MockBackend(), "slow": SlowNoSteerBackend()}, default_backend="mock")
+        runtime.select_backend(10, "slow")
+        app = TelegramGatewayApp(TelegramGatewayConfig(token="1:test", allowed_user_ids={1}, fixed_backend=True), runtime)
+
+        self.assertEqual(app._backend_for_turn(10), "mock")
+        self.assertEqual(runtime.backend_for_chat(10), "mock")
+
+    def test_codex_model_command_rejects_groq_model_override(self):
+        runtime = GatewayRuntime({"codex": MockBackend()}, default_backend="codex")
+        app = TelegramGatewayApp(TelegramGatewayConfig(token="1:test", allowed_user_ids={1}, fixed_backend=True), runtime)
+        fake = FakeTelegramClient()
+        app.client = fake  # type: ignore[assignment]
+
+        app._handle_command(10, 1, "/model groq/llama-3.3-70b-versatile")
+
+        self.assertEqual(runtime.model_for_chat(10), "")
+        self.assertIn("Groq is voice transcription only", fake.sent[-1][1])
+
+    def test_codex_backend_sanitizes_groq_model_override(self):
+        model, note = _codex_model_or_default("groq/llama-3.3-70b-versatile", "gpt-test")
+
+        self.assertEqual(model, "gpt-test")
+        self.assertIn("Ignoring non-Codex model override", note)
 
     def test_profile_loader_maps_simple_bot_file_to_gateway_env(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -421,17 +449,28 @@ class AgentGatewayTests(unittest.TestCase):
         self.assertTrue(ev2.data.get("stream"))
         self.assertIn("the answer", ev2.text)
 
-    def test_codex_sandbox_grants_extra_writable_roots_when_configured(self):
+    def test_codex_sandbox_grants_network_and_extra_writable_roots_when_configured(self):
         from agent_gateway.backends import CodexAppServerBackend
         be = CodexAppServerBackend(sandbox="workspace-write")
-        self.assertEqual(be._sandbox_policy(), {"type": "workspaceWrite"})  # default: no holes
+        # Network is ON by default for the trusted operator bot (fixes the classic
+        # "Could not resolve hostname github.com" sandbox wall).
+        self.assertEqual(be._sandbox_policy(), {"type": "workspaceWrite", "networkAccess": True})
+        # ...and can be toggled off.
+        os.environ["AGENT_GATEWAY_CODEX_NETWORK"] = "0"
+        try:
+            self.assertEqual(be._sandbox_policy(), {"type": "workspaceWrite"})
+        finally:
+            del os.environ["AGENT_GATEWAY_CODEX_NETWORK"]
         os.environ["AGENT_GATEWAY_CODEX_WRITABLE_ROOTS"] = "/opt/x/state, /tmp/extra"
         try:
             pol = be._sandbox_policy()
             self.assertEqual(pol["type"], "workspaceWrite")
             self.assertEqual(pol["writableRoots"], ["/opt/x/state", "/tmp/extra"])
-            # read-only sandboxes are NEVER widened
-            self.assertNotIn("writableRoots", CodexAppServerBackend(sandbox="read-only")._sandbox_policy())
+            self.assertTrue(pol["networkAccess"])
+            # read-only sandboxes are NEVER widened (no writableRoots, no network grant)
+            ro = CodexAppServerBackend(sandbox="read-only")._sandbox_policy()
+            self.assertNotIn("writableRoots", ro)
+            self.assertNotIn("networkAccess", ro)
         finally:
             del os.environ["AGENT_GATEWAY_CODEX_WRITABLE_ROOTS"]
 
@@ -582,6 +621,60 @@ class AgentGatewayTests(unittest.TestCase):
             result = gate.land("agent/x")
             self.assertTrue(result.ok, result.message)
             self.assertTrue((repo / "feature.txt").exists())
+
+    def test_merge_gate_fast_forward_lands_through_dirty_base_preserving_wip(self):
+        # The key simplification: a fast-forward is NOT blocked by a dirty base. Unrelated
+        # uncommitted WIP rides through untouched; git refuses only if the SAME file would
+        # be clobbered (then the WIP is still safe). No more "base checkout dirty" wall.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_base_repo(tmp)
+            self._git(repo, "checkout", "-b", "agent/x")
+            (repo / "feature.txt").write_text("feature\n")
+            self._git(repo, "add", "-A"); self._git(repo, "commit", "-m", "feature")
+            self._git(repo, "checkout", "dev")
+            (repo / "my_wip.txt").write_text("uncommitted unrelated WIP\n")  # dirty base, different file
+            gate = MergeGate(repo=repo, base="dev")
+            a = gate.assess("agent/x")
+            self.assertTrue(a.dirty and a.fast_forward and a.landable)  # dirty but still landable (FF)
+            result = gate.land("agent/x")
+            self.assertTrue(result.ok, result.message)
+            self.assertTrue((repo / "feature.txt").exists())  # landed
+            self.assertEqual((repo / "my_wip.txt").read_text().strip(), "uncommitted unrelated WIP")  # WIP safe
+
+    def test_merge_gate_non_fast_forward_auto_stashes_dirty_base_and_restores_wip(self):
+        # A non-ff merge needs a clean tree; rather than block, the gate auto-stashes the
+        # operator's WIP, merges, and restores it — so a dirty base never blocks a land.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_base_repo(tmp)
+            self._git(repo, "checkout", "-b", "agent/x")
+            (repo / "feature.txt").write_text("feature\n")
+            self._git(repo, "add", "-A"); self._git(repo, "commit", "-m", "feature")
+            self._git(repo, "checkout", "dev")
+            (repo / "base.txt").write_text("dev moved on\n")  # diverge dev → non-ff
+            self._git(repo, "add", "-A"); self._git(repo, "commit", "-m", "dev advances")
+            (repo / "my_wip.txt").write_text("uncommitted WIP\n")  # dirty base
+            gate = MergeGate(repo=repo, base="dev")
+            a = gate.assess("agent/x")
+            self.assertTrue(a.dirty and not a.fast_forward and a.landable)
+            result = gate.land("agent/x")
+            self.assertTrue(result.ok, result.message)
+            self.assertTrue((repo / "feature.txt").exists())  # landed via merge commit
+            self.assertEqual((repo / "my_wip.txt").read_text().strip(), "uncommitted WIP")  # WIP restored
+            self.assertEqual(str(self._git(repo, "stash", "list")).strip(), "")  # no orphaned stash
+
+    def test_worktree_describe_branch_reports_agent_task_and_diffstat(self):
+        from agent_gateway.worktrees import _describe_branch
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._make_base_repo(tmp)
+            self._git(repo, "checkout", "-b", "agent/codex/abc")
+            (repo / "x.py").write_text("print(1)\nprint(2)\n")
+            self._git(repo, "add", "-A"); self._git(repo, "commit", "-m", "codex: wire the thing")
+            self._git(repo, "checkout", "dev")
+            d = _describe_branch(repo, "dev", "agent/codex/abc")
+            self.assertEqual(d["agent"], "codex")
+            self.assertEqual(d["subject"], "codex: wire the thing")
+            self.assertEqual(d["files"], 1)
+            self.assertEqual(d["insertions"], 2)
 
     def test_merge_gate_diverged_clean_lands(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1046,20 +1139,31 @@ class AgentGatewayTests(unittest.TestCase):
             def after_turn(self, turn, final_text):
                 calls["after"].append((turn.text, final_text))
 
-        runtime = GatewayRuntime({"mock": MockBackend()}, default_backend="mock")
-        app = TelegramGatewayApp(TelegramGatewayConfig(token="1:test", allowed_user_ids={1}), runtime)
-        app.client = FakeTelegramClient()  # type: ignore[assignment]
-        app.hook = RecordingHook()  # type: ignore[assignment]
-        seen = {}
-        orig = runtime.submit
+        # Worktree prep runs before the hook in _submit; disable it so the test
+        # is hermetic — it must pass from a fresh clone / non-repo dir, not only
+        # when cwd happens to be a healthy git checkout.
+        old_wt = os.environ.get("AGENT_GATEWAY_AUTO_WORKTREE")
+        os.environ["AGENT_GATEWAY_AUTO_WORKTREE"] = "0"
+        try:
+            runtime = GatewayRuntime({"mock": MockBackend()}, default_backend="mock")
+            app = TelegramGatewayApp(TelegramGatewayConfig(token="1:test", allowed_user_ids={1}), runtime)
+            app.client = FakeTelegramClient()  # type: ignore[assignment]
+            app.hook = RecordingHook()  # type: ignore[assignment]
+            seen = {}
+            orig = runtime.submit
 
-        def spy(turn, emit):
-            seen["augment"] = turn.augment
-            return orig(turn, emit)
+            def spy(turn, emit):
+                seen["augment"] = turn.augment
+                return orig(turn, emit)
 
-        runtime.submit = spy  # type: ignore[assignment]
-        app._submit(1, 1, "do the thing", None)
-        self.assertTrue(runtime.wait_for_idle(1, timeout=3))
+            runtime.submit = spy  # type: ignore[assignment]
+            app._submit(1, 1, "do the thing", None)
+            self.assertTrue(runtime.wait_for_idle(1, timeout=3))
+        finally:
+            if old_wt is None:
+                os.environ.pop("AGENT_GATEWAY_AUTO_WORKTREE", None)
+            else:
+                os.environ["AGENT_GATEWAY_AUTO_WORKTREE"] = old_wt
         self.assertEqual(calls["before"], 1)
         self.assertEqual(seen["augment"], "INJECTED-BRAIN-CONTEXT")  # context reached the turn
         self.assertEqual(len(calls["after"]), 1)  # turn recorded

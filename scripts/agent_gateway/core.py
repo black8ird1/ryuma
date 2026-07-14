@@ -140,6 +140,7 @@ class BackendCapabilities:
     write_access: bool = False
     compact_final: bool = True
     model_suggestions: tuple[str, ...] = ()  # common models, shown as /model tap-buttons (free-text still works)
+    effort_suggestions: tuple[str, ...] = ()  # official effort levels, shown as /effort tap-buttons
 
     def summary(self) -> str:
         flags = []

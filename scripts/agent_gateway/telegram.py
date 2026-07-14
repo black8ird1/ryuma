@@ -31,6 +31,7 @@ def _telegram_ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = _telegram_ipv4_getaddrinfo
 
 from .backends import build_backends_from_env
+from .backends import _looks_like_non_openai_model
 from .core import (
     AgentEvent,
     AgentTurn,
@@ -130,23 +131,46 @@ class TelegramClient:
         res.raise_for_status()
         return res.json()
 
-    def send_file(self, chat_id: int, path: Path, caption: str = "") -> int | None:
-        """Send a local image/file to Telegram. PNG-like assets go as documents so
-        logo transparency and exact bytes survive Telegram's photo compression."""
-        method = "sendPhoto" if path.suffix.lower() in {".jpg", ".jpeg"} else "sendDocument"
-        field = "photo" if method == "sendPhoto" else "document"
-        data: dict[str, Any] = {"chat_id": chat_id}
-        if caption:
-            data["caption"] = caption[:1024]
-        with open(path, "rb") as fh:
-            res = requests.post(
-                f"{self.base}/{method}",
-                data=data,
-                files={field: (path.name, fh)},
-                timeout=120,
-            )
-        res.raise_for_status()
-        payload = res.json()
+    def send_file(
+        self,
+        chat_id: int,
+        path: Path,
+        caption: str = "",
+        *,
+        prevent_compression: bool = False,
+    ) -> int | None:
+        """Send a local image/file to Telegram.
+
+        Default: deliver as an inline PHOTO (Telegram-compressed) so previews and
+        screenshots are viewable in one tap on mobile, not a file the user has to
+        download first. Set ``prevent_compression=True`` only when exact bytes matter
+        (logo assets, pixel-exact deliverables) — those go as a document. We also fall
+        back to a document automatically if the photo upload is rejected (Telegram
+        caps photos at ~10MB / 10000px per side)."""
+
+        def _post(method: str, field: str) -> dict[str, Any]:
+            data: dict[str, Any] = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption[:1024]
+            with open(path, "rb") as fh:
+                res = requests.post(
+                    f"{self.base}/{method}",
+                    data=data,
+                    files={field: (path.name, fh)},
+                    timeout=120,
+                )
+            res.raise_for_status()
+            return res.json()
+
+        if not prevent_compression:
+            try:
+                payload = _post("sendPhoto", "photo")
+                if payload.get("ok"):
+                    return int((payload.get("result") or {}).get("message_id") or 0) or None
+            except Exception:
+                pass  # oversize / non-photo asset — fall through to document
+
+        payload = _post("sendDocument", "document")
         return int((payload.get("result") or {}).get("message_id") or 0) or None
 
     def send(self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> int | None:
@@ -254,6 +278,25 @@ class TelegramGatewayApp:
         self.bot_key = bot_id_from_token(self.config.token, fallback=os.environ.get("AGENT_GATEWAY_PROFILE", "bot"))
         self.livestore = LiveStore(LIVE_STORE_DIR)
         self.offset_file = self.state_dir / "offset"
+        # Wake-turn delivery: when the warm claude worker self-wakes on a
+        # background-task completion while the chat is idle, the backend's idle
+        # watcher hands the finished turn here — otherwise those turns strand in
+        # the pipe and the next user message discards them (the "bot never wakes
+        # up, I probe and get nothing" failure).
+        claude_backend = runtime.backends.get("claude")
+        if claude_backend is not None and hasattr(claude_backend, "on_wake_turn"):
+            claude_backend.on_wake_turn = self._deliver_wake_turn
+
+    def _deliver_wake_turn(self, chat_id: int, text: str) -> None:
+        """Send a self-woken (background-task completion) turn to the chat as its
+        own message. Runs on the backend's watcher thread — keep it plain sends;
+        any failure is logged, never raised into the watcher."""
+        try:
+            mode = self.runtime.mode_for_chat(chat_id)
+            final_text, reply_markup = self._final_text_and_markup(chat_id, mode, text)
+            self.client.send(chat_id, f"⏰ {final_text}", reply_markup=reply_markup)
+        except Exception as exc:  # noqa: BLE001
+            print(f"wake-turn delivery failed for chat {chat_id}: {exc}", flush=True)
 
     def _publish(self, chat_id: int, snapshot: dict) -> None:
         """Keep the in-memory snapshot mirror (used by /status). The Mini App / disk
@@ -342,6 +385,18 @@ class TelegramGatewayApp:
         label = f"{backend} · pick a model:" if models else f"{backend} · type /model <name> (no suggestions)"
         self._send_or_edit(chat_id, label, {"inline_keyboard": rows} if rows else None, message_id)
 
+    def _show_efforts(self, chat_id: int, message_id=None) -> None:
+        """Tap-button picker of the current backend's OFFICIAL effort levels. The
+        chosen level is passed straight to the agent (e.g. `claude --effort`), so the
+        level shown in each reply's footer is the level the model actually runs at."""
+        backend = self.runtime.backend_for_chat(chat_id)
+        obj = self.runtime.backends.get(backend)
+        levels = list(getattr(obj.capabilities, "effort_suggestions", ()) if obj else ())
+        cur = self.runtime.effort_for_chat(chat_id) or getattr(obj, "effort", "") if obj else ""
+        rows = [[{"text": ("✓ " if lvl == cur else "") + lvl, "callback_data": f"pe:{lvl}"}] for lvl in levels]
+        label = f"{backend} · pick effort level:" if levels else f"{backend} · type /effort <level>"
+        self._send_or_edit(chat_id, label, {"inline_keyboard": rows} if rows else None, message_id)
+
     def _agents_overview(self, chat_id: int) -> None:
         """Status board for the agents you can drive: which are installed + ready,
         which need a one-line install/login, and a tap to switch the current one.
@@ -382,16 +437,28 @@ class TelegramGatewayApp:
         )
         reply_markup = None
         if self._startup_worktrees:
-            text += f"\n\n📝 {len(self._startup_worktrees)} unsaved change-set(s) from before — tap to keep:"
+            n = len(self._startup_worktrees)
+            text += f"\n\n🌿 {n} unmerged work branch(es) survived the last restart — here's what each holds:"
             rows: list[list[dict[str, str]]] = []
             for idx, wt in enumerate(self._startup_worktrees[:8], start=1):
                 branch = str(wt.get("branch"))
+                agent = str(wt.get("agent") or "agent")
+                subject = str(wt.get("subject") or "(no commit message)")
+                files, ins, dels, ahead = wt.get("files") or 0, wt.get("insertions") or 0, wt.get("deletions") or 0, wt.get("ahead") or 0
+                text += (f"\n\n**{idx}.** {agent} — \"{subject}\""
+                         f"\n   {ahead} commit(s) · {files} file(s) · +{ins} −{dels}")
                 self._land_serial += 1
                 key = f"startup.{self._land_serial}"
                 self._land_tokens[key] = branch
-                rows.append([{"text": f"✅ Keep change-set {idx} ({wt.get('ahead')})", "callback_data": f"land:{key}"}])
+                self._discard_tokens[key] = branch
+                rows.append([
+                    {"text": f"✅ Keep #{idx} → {self.merge_gate.base}", "callback_data": f"land:{key}"},
+                    {"text": f"🗑 Discard #{idx}", "callback_data": f"disc:{key}"},
+                ])
             while len(self._land_tokens) > 60:
                 self._land_tokens.pop(next(iter(self._land_tokens)))
+            while len(self._discard_tokens) > 60:
+                self._discard_tokens.pop(next(iter(self._discard_tokens)))
             reply_markup = {"inline_keyboard": rows}
         for chat_id in sorted(self.config.allowed_user_ids):
             try:
@@ -500,6 +567,11 @@ class TelegramGatewayApp:
             self.runtime.set_model(chat_id, model)
             self._send_or_edit(chat_id, f"✓ {backend} · {model}", None, mid)
             return
+        if data.startswith("pe:"):  # picked an official effort level — set + confirm in place
+            level = data[3:]
+            self.runtime.set_effort(chat_id, level)
+            self._send_or_edit(chat_id, f"✓ effort · {level}", None, mid)
+            return
         if data.startswith("skill:"):
             prompt = self._skill_prompts.get(data[6:])
             if not prompt:
@@ -530,7 +602,8 @@ class TelegramGatewayApp:
             return
         result = self.merge_gate.land(branch)
         if result.ok:
-            self.worktrees.remove_branch(branch)  # landed → reclaim the worktree
+            # landed → reclaim the worktree AND the branch (safe -d, merged-only)
+            self.worktrees.remove_branch(branch, delete_branch=True)
             self.client.send(chat_id, "✅ Saved.")
             return
         extra = ("\nConflicts: " + ", ".join(result.conflicts)) if result.conflicts else ""
@@ -669,6 +742,10 @@ class TelegramGatewayApp:
                 self._setup_picker(chat_id)
                 return
             if cmd == "/model":
+                backend = self.runtime.backend_for_chat(chat_id)
+                if backend == "codex" and _looks_like_non_openai_model(rest):
+                    self.client.send(chat_id, f"Model not changed. `{rest}` is not a Codex/OpenAI model; Groq is voice transcription only here.")
+                    return
                 self.runtime.set_model(chat_id, rest)
                 self.client.send(chat_id, f"Model → {rest}")
                 return
@@ -682,12 +759,20 @@ class TelegramGatewayApp:
                 self.client.send(chat_id, str(exc))
             return
         if cmd == "/effort":
-            if rest:
-                self.runtime.set_effort(chat_id, rest)
-                self.client.send(chat_id, f"Effort → {rest}")
-            else:
-                cur = self.runtime.effort_for_chat(chat_id) or "(backend default)"
-                self.client.send(chat_id, f"Effort: {cur}\nUsage: /effort <value> — e.g. /effort high, or a number. Interpreted by the current agent.")
+            # No arg → tap-button picker of OFFICIAL levels. Arg → set it, but only
+            # an official level (so the footer reflects what the model actually runs).
+            if not rest:
+                self._show_efforts(chat_id)
+                return
+            backend = self.runtime.backend_for_chat(chat_id)
+            obj = self.runtime.backends.get(backend)
+            levels = tuple(getattr(obj.capabilities, "effort_suggestions", ()) if obj else ())
+            choice = rest.strip().lower()
+            if levels and choice not in levels:
+                self.client.send(chat_id, f"Unknown effort '{rest}'. Pick an official level: {', '.join(levels)}")
+                return
+            self.runtime.set_effort(chat_id, choice)
+            self.client.send(chat_id, f"Effort → {choice}")
             return
         if cmd == "/plan":
             if not rest:
@@ -715,7 +800,7 @@ class TelegramGatewayApp:
         self._submit(chat_id, user_id, text, None)
 
     def _submit(self, chat_id: int, user_id: int, text: str, reply_context: ReplyContext | None, attachments: tuple[Attachment, ...] = (), mode_override: "Mode | None" = None) -> None:
-        backend = self.runtime.backend_for_chat(chat_id)
+        backend = self._backend_for_turn(chat_id)
         # If a steering-capable turn is already running, FOLD this message into it
         # with NO new card — it lands in the original turn's live message.
         fold = AgentTurn(chat_id=chat_id, user_id=user_id, text=text, backend=backend,
@@ -862,7 +947,7 @@ class TelegramGatewayApp:
                 workdir=turn_workdir,
                 attachments=attachments,
                 model=self.runtime.model_for_chat(chat_id),
-                effort=self.runtime.effort_for_chat(chat_id),
+                effort=self.runtime.effort_for_chat(chat_id) or getattr(self.runtime.backends.get(backend), "effort", ""),
             )
             try:
                 augment = self.hook.before_turn(turn) or ""
@@ -928,6 +1013,24 @@ class TelegramGatewayApp:
         for idx in range(1 if edited else 0, len(chunks)):
             self.client.send(chat_id, chunks[idx], reply_markup=reply_markup if idx == last else None)
 
+    def _backend_for_turn(self, chat_id: int) -> str:
+        """Resolve the backend that may answer a turn.
+
+        Fixed-profile bots are separate Telegram identities (Codex bot, Claude
+        bot, etc.). A stale in-memory chat preference must not make the Codex bot
+        answer through another backend after a prior /agent switch or profile
+        reuse. Force the runtime preference back to the profile default every turn.
+        """
+        if not self.config.fixed_backend:
+            return self.runtime.backend_for_chat(chat_id)
+        backend = self.runtime.default_backend
+        if self.runtime.backend_for_chat(chat_id) != backend:
+            try:
+                self.runtime.select_backend(chat_id, backend)
+            except ValueError:
+                pass
+        return backend
+
     def _final_text_and_markup(self, chat_id: int, mode: str, text: str, *, cwd: Path | None = None) -> tuple[str, dict[str, Any] | None]:
         clean, request = extract_post_turn_request(text)
         post_lines: list[str] = []
@@ -976,7 +1079,8 @@ class TelegramGatewayApp:
         if self.smart_merge and assessment.landable and not assessment.likely_conflict:
             result = self.merge_gate.land(branch)
             if result.ok:
-                self.worktrees.remove_branch(branch)  # landed → drop the worktree
+                # landed → drop the worktree AND the branch (safe -d, merged-only)
+                self.worktrees.remove_branch(branch, delete_branch=True)
                 n = assessment.ahead
                 return f"✅ Saved · {n} update{'' if n == 1 else 's'}", None
             # land surprised us (a real conflict the guess missed) → fall through to the gate
@@ -1027,7 +1131,7 @@ class TelegramGatewayApp:
             "/status — agent · model · effort\n"
             "/model — pick model (tap or type)\n"
             "/agents — add or switch agent (Claude, Codex)\n"
-            "/effort <level> — set effort (e.g. ultra)\n"
+            "/effort — pick effort level (low · medium · high · xhigh · max)\n"
             f"{switch}"
             "\nNo /commit or /merge ceremony — it proposes scoped git, you tap to land."
         )

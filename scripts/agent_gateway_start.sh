@@ -71,6 +71,7 @@ start_with_systemd() {
     --setenv=AGENT_GATEWAY_SEND_ONLINE_MESSAGE=1 \
     --property=Restart=always \
     --property=RestartSec=3 \
+    --property=MemoryHigh="${AGENT_GATEWAY_MEMORY_HIGH:-2G}" \
     --property=StandardOutput="append:${ROOT}/${logfile}" \
     --property=StandardError="append:${ROOT}/${logfile}" \
     "$PYTHON_BIN" "$ROOT/scripts/agent_gateway_bot.py" --profile "$profile" >/dev/null

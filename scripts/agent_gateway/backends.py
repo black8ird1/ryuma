@@ -99,7 +99,7 @@ class CodexExecBackend:
     codex_bin: str = "codex"
     model: str = os.environ.get("CODEX_MODEL", os.environ.get("OPENAI_MODEL", "gpt-5.5"))
     sandbox: str = "workspace-write"
-    timeout_sec: int = 900
+    timeout_sec: int = 1800
     workdir: Path = ROOT
     runs_dir: Path = ROOT / "state" / "agent-gateway" / "runs"
     effort: str = os.environ.get("AGENT_GATEWAY_CODEX_EFFORT", os.environ.get("CODEX_REASONING_EFFORT", "medium"))
@@ -124,6 +124,7 @@ class CodexExecBackend:
             write_access=self.sandbox != "read-only",
             compact_final=True,
             model_suggestions=("gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+            effort_suggestions=("low", "medium", "high", "xhigh"),
         )
 
     def run(
@@ -136,6 +137,9 @@ class CodexExecBackend:
         prompt = _gateway_prompt(turn)
         workdir = turn.workdir or self.workdir
         out_path = self._out_path(turn)
+        model, model_note = _codex_model_or_default(turn.model, self.model)
+        if model_note:
+            emit(AgentEvent("status", model_note, backend="codex", data={"phase": "model"}))
         session = self.sessions.get(turn.chat_id) if self.persist_write_sessions and turn.mode == "write" else None
         resume_id = str(session.get("thread_id")) if session and session.get("thread_id") else None
         turns = int(session.get("turns") or 0) if session else 0
@@ -147,7 +151,7 @@ class CodexExecBackend:
         thread_holder: dict[str, str] = {}
         cmd = self.build_cmd(
             prompt, out_path=out_path, resume_id=resume_id, persistent=turn.mode == "write", workdir=workdir,
-            model=turn.model or self.model, effort=turn.effort or self.effort,
+            model=model, effort=turn.effort or self.effort,
         )
 
         def parser(line: str):
@@ -319,7 +323,7 @@ class CodexAppServerBackend:
     codex_bin: str = "codex"
     model: str = os.environ.get("AGENT_GATEWAY_CODEX_MODEL", os.environ.get("CODEX_MODEL", "gpt-5.5"))
     sandbox: str = os.environ.get("AGENT_GATEWAY_CODEX_SANDBOX", "workspace-write")
-    timeout_sec: int = 900
+    timeout_sec: int = 1800
     workdir: Path = ROOT
     effort: str = os.environ.get("AGENT_GATEWAY_CODEX_EFFORT", os.environ.get("CODEX_REASONING_EFFORT", "medium"))
     max_session_turns: int = int(os.environ.get("AGENT_GATEWAY_CODEX_MAX_SESSION_TURNS", "8"))
@@ -363,6 +367,13 @@ class CodexAppServerBackend:
             roots = [p.strip() for p in os.environ.get("AGENT_GATEWAY_CODEX_WRITABLE_ROOTS", "").split(",") if p.strip()]
             if roots:
                 policy = {**policy, "writableRoots": roots}
+            # workspaceWrite blocks ALL network by default (networkAccess=false), so
+            # codex can't resolve hostnames / npm install / git fetch — the classic
+            # "Could not resolve hostname github.com" sandbox wall. For a single trusted
+            # operator's own bot, grant network by default (toggle off with
+            # AGENT_GATEWAY_CODEX_NETWORK=0). danger-full-access already has network.
+            if os.environ.get("AGENT_GATEWAY_CODEX_NETWORK", "1").strip().lower() not in {"0", "false", "no", "off"}:
+                policy = {**policy, "networkAccess": True}
         return policy
 
     def _ensure_worker(self, chat_id: int, emit: Emit) -> _AppServerWorker:
@@ -410,6 +421,16 @@ class CodexAppServerBackend:
         workdir = turn.workdir or self.workdir
         worker = self._ensure_worker(turn.chat_id, emit)
         self._ensure_thread(worker, workdir)
+        # Drain notifications left over from a previous turn. The timeout/stop paths
+        # interrupt and RETURN, so the aborted turn's turn/aborted (and any late
+        # turn/completed) lands in the queue afterward — read as THIS turn's events it
+        # ends the turn instantly ("Codex completed with no text"), and each abandoned
+        # turn queues another completion, so every later turn dies the same way.
+        while True:
+            try:
+                worker.notifs.get_nowait()
+            except queue.Empty:
+                break
         start = worker.request("turn/start", {
             "threadId": worker.thread_id,
             # cwd + sandbox + approval MUST be set per-TURN, not just at thread/start.
@@ -480,10 +501,16 @@ class CodexAppServerBackend:
             label = _codex_item_label(p.get("item") or {})
             if label:
                 emit(AgentEvent("tool", label, backend="codex", data={"category": "cmd", "phase": "tool"}))
-        elif method == "turn/completed":
-            return True
-        elif method in ("turn/failed", "turn/aborted"):
-            emit(AgentEvent("error", str(p.get("error") or method), backend="codex"))
+        elif method in ("turn/completed", "turn/failed", "turn/aborted"):
+            # Turn-level events nest the id at params.turn.id (no flat turnId), so the
+            # stray filter above never sees them — match explicitly, else a late
+            # completion from an interrupted previous turn ends THIS turn with no text.
+            evt_turn_id = str(((p.get("turn") or {}).get("id")) or p.get("turnId") or "")
+            if turn_id and evt_turn_id and evt_turn_id != turn_id:
+                return False
+            if method != "turn/completed":
+                err = p.get("error") or (p.get("turn") or {}).get("error") or method
+                emit(AgentEvent("error", str(err), backend="codex"))
             return True
         elif method == "_eof":
             raise _AppServerDown("app-server closed the stream")
@@ -538,6 +565,10 @@ class ClaudePrintBackend:
     claude_bin: str = "claude"
     model: str = os.environ.get("CLAUDE_MODEL", "")
     fallback_model: str = os.environ.get("AGENT_GATEWAY_CLAUDE_FALLBACK_MODEL", os.environ.get("CLAUDE_FALLBACK_MODEL", ""))
+    # Effort actually passed to `claude --effort` (and surfaced in the footer, so the
+    # displayed level is the level the model runs at — not a value the user guessed).
+    # Default "high": the documented Claude Code default for Opus 4.8 / Sonnet 5.
+    effort: str = os.environ.get("AGENT_GATEWAY_CLAUDE_EFFORT", "high")
     # 'dontAsk' = autonomous + works as ROOT. 'bypassPermissions'/--dangerously-skip-
     # permissions are REJECTED under root/sudo (the gateway runs as root via systemd),
     # and bare 'default' would block on a permission prompt with no TTY to answer. So a
@@ -547,7 +578,7 @@ class ClaudePrintBackend:
     # "read-only diagnostic mode" bug). Grant the core write tools, same as the proven
     # specialized bot, so the gateway can actually build.
     allowed_tools: str = os.environ.get("AGENT_GATEWAY_CLAUDE_ALLOWED_TOOLS", os.environ.get("CLAUDE_ALLOWED_TOOLS", "Read,Edit,Write,Bash,Glob,Grep"))
-    timeout_sec: int = 900
+    timeout_sec: int = 1800
     workdir: Path = ROOT
     home: str = os.environ.get("AGENT_GATEWAY_CLAUDE_HOME", os.environ.get("HOME", "/root"))
     thinking_tokens: int = int(os.environ.get("AGENT_GATEWAY_CLAUDE_THINKING_TOKENS", os.environ.get("MAX_THINKING_TOKENS", "4000") or "0"))
@@ -558,6 +589,14 @@ class ClaudePrintBackend:
     # (e.g. Fable) so the orphan is absorbed into THIS reply, not leaked to the next.
     orphan_quiet_sec: float = float(os.environ.get("AGENT_GATEWAY_CLAUDE_ORPHAN_QUIET_SEC", "3"))
     orphan_drain_sec: float = float(os.environ.get("AGENT_GATEWAY_CLAUDE_ORPHAN_DRAIN_SEC", "60"))
+    # chat_id -> claude session_id map, persisted to disk so a process restart
+    # (OOM kill, deploy) RESUMES the same session instead of minting a fresh one
+    # and losing the operator's context. Claude keeps the transcript on disk, so
+    # --resume works across restarts; if the saved session is truly gone, the
+    # existing session-drift self-heal falls back to fresh.
+    session_state_path: str = os.environ.get(
+        "AGENT_GATEWAY_CLAUDE_SESSION_STATE", str(ROOT / "state" / "agent-gateway" / "claude-sessions.json")
+    )
 
     def __post_init__(self) -> None:
         self._workers: dict[int, _ClaudeWorker] = {}
@@ -565,8 +604,46 @@ class ClaudePrintBackend:
         self._started: set[int] = set()
         self._turns: dict[int, int] = {}
         self._worker_sig: dict[int, tuple[str, int, str]] = {}
-        self._pending_sig: tuple[str, int, str] = (self.model, self.thinking_tokens, self.permission_mode)
+        self._pending_sig: tuple[str, int, str, str] = (self.model, self.thinking_tokens, self.permission_mode, self.effort)
         self._lock = threading.RLock()
+        # WAKE-TURN DELIVERY (2026-07-03). The claude worker SELF-WAKES while the
+        # chat is idle when a harness-tracked background task (Bash run_in_
+        # background, workflows, ScheduleWakeup) completes — verified empirically:
+        # a full turn streams to stdout with zero stdin input. Without a
+        # between-turns consumer that turn sat unread in worker.lines and the
+        # NEXT user message DISCARDED it via _drain_queue (the founder's "bot
+        # doesn't wake up, I have to probe" symptom — probing actually deleted
+        # the results). The idle watcher below owns worker.lines between turns
+        # and hands each completed wake turn to `on_wake_turn` (wired by the
+        # transport layer to a plain Telegram send).
+        self.on_wake_turn: object | None = None  # Callable[[int, str], None]
+        self._idle_watchers: dict[int, tuple[threading.Thread, threading.Event]] = {}
+        self._load_sessions()
+
+    def _load_sessions(self) -> None:
+        """Restore chat_id->session_id (+ started set) from disk on startup so a
+        restart resumes prior conversations. Live workers never survive a restart,
+        so _turns/_workers stay empty — only the resumable session id is restored."""
+        try:
+            data = json.loads(Path(self.session_state_path).read_text())
+            self._sessions = {int(k): str(v) for k, v in (data.get("sessions") or {}).items()}
+            self._started = {int(c) for c in (data.get("started") or [])}
+        except (OSError, ValueError, TypeError):
+            self._sessions, self._started = {}, set()
+
+    def _save_sessions(self) -> None:
+        """Atomically persist the session map so the next process can --resume."""
+        try:
+            path = Path(self.session_state_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "sessions": {str(k): v for k, v in self._sessions.items()},
+                "started": sorted(self._started),
+            }))
+            tmp.replace(path)
+        except OSError:
+            pass
 
     @property
     def capabilities(self) -> BackendCapabilities:
@@ -583,10 +660,26 @@ class ClaudePrintBackend:
             voice=True,
             write_access=True,
             compact_final=False,
-            model_suggestions=("claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"),
+            model_suggestions=("claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"),
+            effort_suggestions=("low", "medium", "high", "xhigh", "max"),
         )
 
     def run(
+        self,
+        turn: AgentTurn,
+        emit: Emit,
+        stop_event: threading.Event,
+        injections: InjectionBuffer,
+    ) -> str:
+        try:
+            return self._run_with_heal(turn, emit, stop_event, injections)
+        finally:
+            # Re-arm the between-turns wake watcher whenever a live worker is
+            # left idle, so a background-task completion turn is delivered
+            # instead of stranding in worker.lines (see __post_init__ note).
+            self._start_idle_watcher(turn.chat_id)
+
+    def _run_with_heal(
         self,
         turn: AgentTurn,
         emit: Emit,
@@ -602,7 +695,8 @@ class ClaudePrintBackend:
         # write turn flips back to the build default — so we're ALWAYS back in write
         # after a one-shot /plan (different sig → respawn back). No session lost.
         permission = "plan" if turn.mode == "plan" else self.permission_mode
-        desired = (turn.model or self.model, _claude_thinking_tokens(turn.effort, self.thinking_tokens), permission)
+        effort = _normalize_claude_effort(turn.effort or self.effort)
+        desired = (turn.model or self.model, _claude_thinking_tokens(turn.effort, self.thinking_tokens), permission, effort)
         if turn.chat_id in self._workers and self._worker_sig.get(turn.chat_id) != desired:
             self._terminate_worker(turn.chat_id)
             emit(AgentEvent("status", f"Claude reconfigured ({desired[0] or 'default'}); restarting worker.", backend="claude", data={"phase": "session"}))
@@ -634,14 +728,23 @@ class ClaudePrintBackend:
     ) -> tuple[str, bool, str]:
         """One turn attempt. Returns (final_text, session_drift, error_text).
         Never emits the terminal error itself — run() decides heal-or-surface."""
+        # Take the pipe back from the between-turns wake watcher FIRST. If a wake
+        # turn is mid-flight, this waits (bounded) for its result and delivers it,
+        # so the new turn can't eat the wake turn's `result` as its own.
+        self._stop_idle_watcher(turn.chat_id)
         worker = self._ensure_worker(turn.chat_id, emit, workdir=turn.workdir)
         final_chunks: list[str] = []
         streamed_answer: list[str] = []  # the answer as it streamed (text_delta) — a fallback
         injected = False
         started = time.time()
+        last_output = started  # silence-watchdog clock — reset on every output line below
         # Flush any output still sitting in the pipe from a prior turn's late/orphan
-        # result, so it can't be misattributed to this turn.
-        _drain_queue(worker.lines)
+        # result, so it can't be misattributed to this turn. With the wake watcher
+        # in place this should be empty; a non-zero count is logged as it means
+        # output was produced idle-time with no watcher running (a bug signal).
+        stale = _drain_queue(worker.lines)
+        if stale:
+            print(f"claude wake-gap: discarded {len(stale)} idle stdout lines for chat {turn.chat_id}", flush=True)
         try:
             # System prompt is already in --append-system-prompt; don't re-bill it.
             self._send_user_message(worker, _gateway_prompt(turn, include_system=False))
@@ -652,9 +755,14 @@ class ClaudePrintBackend:
             if stop_event.is_set():
                 self._terminate_worker(turn.chat_id)
                 return "Stopped.", False, ""
-            if time.time() - started > self.timeout_sec:
+            # Silence watchdog (NOT a wall-clock cap): abort only when the worker has
+            # produced NO output for timeout_sec. A turn that is actively streaming or
+            # running a long tool/subagent batch never dies; a genuinely hung worker
+            # still auto-recovers. The old `time.time() - started` cap guillotined long
+            # but healthy turns (e.g. multi-agent research) mid-work — the 900s-timeout bug.
+            if time.time() - last_output > self.timeout_sec:
                 self._terminate_worker(turn.chat_id)
-                return "", False, f"Claude turn timed out after {self.timeout_sec}s."
+                return "", False, f"Claude turn stalled — no output for {self.timeout_sec}s."
             # Steer: fold mid-turn messages into the live turn immediately. Drain is
             # non-blocking, so this adds no per-line latency to streaming output.
             batch = injections.drain()
@@ -673,6 +781,7 @@ class ClaudePrintBackend:
                     err = self._dead_worker_stderr(worker, turn.chat_id, "Claude worker exited.")
                     return "", _is_session_drift(err), err
                 continue
+            last_output = time.time()  # output received → reset the silence watchdog
             if line is None:
                 err = self._dead_worker_stderr(worker, turn.chat_id, "Claude worker closed stdout.")
                 return "", _is_session_drift(err), err
@@ -697,19 +806,32 @@ class ClaudePrintBackend:
                     # absorb it into THIS reply (off-by-one protection), tolerating
                     # long silent thinking before it appears.
                     final_chunks.extend(self._drain_claude_trailing(worker, emit, deadline=time.time() + self.orphan_drain_sec))
-                self._started.add(turn.chat_id)
-                self._turns[turn.chat_id] = self._turns.get(turn.chat_id, 0) + 1
                 text = "\n\n".join(_dedupe_text_chunks(final_chunks)).strip()
                 if not text:
                     text = "".join(streamed_answer).strip()  # fall back to what already streamed
-                    # Log WHY the structured final was empty so the irregular cause is
-                    # confirmable next time (result subtype / whether any text streamed).
+                if not text:
+                    # No text AND nothing streamed. Inspect the result subtype: an error
+                    # subtype (e.g. error_during_execution) means claude's CLI faulted
+                    # mid-turn — typically a corrupt/incompatible RESUMED session or a
+                    # worktree cwd that was removed — and returned an empty result. That is
+                    # NOT a real empty answer, so don't silently show "completed with no
+                    # text" (which then recurs on EVERY turn because the bad session keeps
+                    # resuming). Drop the worker and signal drift → run() resets the session
+                    # (clearing the persisted bad id) and retries FRESH.
                     try:
-                        subtype = str((json.loads(line) or {}).get("subtype") or "?")
+                        subtype = str((json.loads(line) or {}).get("subtype") or "")
                     except Exception:  # noqa: BLE001
-                        subtype = "?"
-                    print(f"claude empty-final fallback: subtype={subtype} recovered={len(text)}c "
-                          f"streamed={bool(streamed_answer)} chunks={len(final_chunks)}", flush=True)
+                        subtype = ""
+                    print(f"claude empty-final: subtype={subtype} streamed={bool(streamed_answer)} "
+                          f"chunks={len(final_chunks)}", flush=True)
+                    if subtype and subtype != "success":
+                        self._terminate_worker(turn.chat_id)
+                        return "", True, f"claude {subtype}"
+                # A genuinely completed turn — only NOW mark the session resumable, so a
+                # failed/errored turn never persists a poisoned session id to disk.
+                self._started.add(turn.chat_id)
+                self._save_sessions()
+                self._turns[turn.chat_id] = self._turns.get(turn.chat_id, 0) + 1
                 return text or "Claude completed with no text.", False, ""
 
     def _dead_worker_stderr(self, worker: "_ClaudeWorker", chat_id: int, fallback: str) -> str:
@@ -724,11 +846,13 @@ class ClaudePrintBackend:
         self._sessions.pop(chat_id, None)
         self._started.discard(chat_id)
         self._turns.pop(chat_id, None)
+        self._save_sessions()
 
-    def build_cmd(self, chat_id: int, model: str, permission: str = "") -> tuple[list[str], str, bool]:
+    def build_cmd(self, chat_id: int, model: str, permission: str = "", effort: str = "") -> tuple[list[str], str, bool]:
         session_id = self._sessions.get(chat_id) or str(uuid.uuid4())
         resume = chat_id in self._started
         self._sessions[chat_id] = session_id
+        self._save_sessions()
         cmd = [
             self.claude_bin,
             "-p",
@@ -751,6 +875,10 @@ class ClaudePrintBackend:
             cmd += ["--model", model]
         if self.fallback_model:
             cmd += ["--fallback-model", self.fallback_model]
+        # Pass the effort explicitly so the level shown in the footer is the level the
+        # model actually runs at (Claude CLI: `--effort <low|medium|high|xhigh|max>`).
+        eff = _normalize_claude_effort(effort or self.effort)
+        cmd += ["--effort", eff]
         return cmd, session_id, resume
 
     def _ensure_worker(self, chat_id: int, emit: Emit, workdir: Path | None = None) -> _ClaudeWorker:
@@ -759,14 +887,14 @@ class ClaudePrintBackend:
             if existing is not None and existing.proc.poll() is None:
                 return existing
             run_dir = workdir or self.workdir
-            model, thinking, permission = getattr(self, "_pending_sig", (self.model, self.thinking_tokens, self.permission_mode))
-            cmd, session_id, resume = self.build_cmd(chat_id, model, permission)
+            model, thinking, permission, effort = getattr(self, "_pending_sig", (self.model, self.thinking_tokens, self.permission_mode, self.effort))
+            cmd, session_id, resume = self.build_cmd(chat_id, model, permission, effort)
             env = os.environ.copy()
             env.setdefault("TERM", "xterm-256color")
             env["HOME"] = self.home
             if thinking > 0:
                 env["MAX_THINKING_TOKENS"] = str(thinking)
-            self._worker_sig[chat_id] = (model, thinking, permission)
+            self._worker_sig[chat_id] = (model, thinking, permission, effort)
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(run_dir),
@@ -831,6 +959,88 @@ class ClaudePrintBackend:
                 return chunks
         return chunks
 
+    # ── between-turns wake watcher ────────────────────────────────────────
+    def _start_idle_watcher(self, chat_id: int) -> None:
+        """Arm the idle consumer for this chat's live worker. No-op when the
+        worker is dead/absent, delivery isn't wired, or a watcher already runs."""
+        if not callable(self.on_wake_turn):
+            return
+        with self._lock:
+            worker = self._workers.get(chat_id)
+            if worker is None or worker.proc.poll() is not None:
+                return
+            existing = self._idle_watchers.get(chat_id)
+            if existing is not None and existing[0].is_alive():
+                return
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._idle_watch_loop, args=(chat_id, worker, stop),
+                daemon=True, name=f"claude-wake-watch-{chat_id}",
+            )
+            self._idle_watchers[chat_id] = (thread, stop)
+            thread.start()
+
+    def _stop_idle_watcher(self, chat_id: int) -> None:
+        """Hand the pipe back to a real turn. Joins the watcher so the queue has
+        exactly one consumer; the watcher finishes a mid-flight wake turn first
+        (bounded by orphan_drain_sec), so its result can't leak into the new turn."""
+        with self._lock:
+            entry = self._idle_watchers.pop(chat_id, None)
+        if entry is None:
+            return
+        thread, stop = entry
+        stop.set()
+        thread.join(timeout=self.orphan_drain_sec + 5)
+        if thread.is_alive():
+            print(f"claude wake-watch: watcher for chat {chat_id} did not stop in time", flush=True)
+
+    def _idle_watch_loop(self, chat_id: int, worker: "_ClaudeWorker", stop: threading.Event) -> None:
+        """Consume worker.lines while the chat is idle. Each completed wake turn
+        (self-invoked by a background-task completion) is assembled exactly like
+        a real turn's final and handed to on_wake_turn for delivery. On stop:
+        exit at the next quiet point, but never abandon a wake turn mid-stream —
+        finish it (bounded) so the next real turn starts with a clean pipe."""
+        final_chunks: list[str] = []
+        streamed: list[str] = []
+        mid_turn = False
+        stop_seen_at: float | None = None
+        while True:
+            if stop.is_set():
+                if stop_seen_at is None:
+                    stop_seen_at = time.time()
+                if not mid_turn:
+                    return
+                if time.time() - stop_seen_at > self.orphan_drain_sec:
+                    print(f"claude wake-watch: abandoned mid-flight wake turn for chat {chat_id}", flush=True)
+                    return
+            try:
+                line = worker.lines.get(timeout=0.5)
+            except queue.Empty:
+                if worker.proc.poll() is not None:
+                    return
+                continue
+            if line is None:
+                return  # worker exited
+            parsed = _parse_claude_event(line)
+            if parsed is None:
+                continue
+            mid_turn = True
+            event, final = parsed
+            if event is not None and event.kind == "thinking" and event.data.get("stream") and event.data.get("phase") == "writing":
+                streamed.append(event.text)
+            if final:
+                final_chunks.append(final)
+            if _is_result_event(line):
+                text = "\n\n".join(_dedupe_text_chunks(final_chunks)).strip() or "".join(streamed).strip()
+                final_chunks, streamed, mid_turn = [], [], False
+                if text:
+                    try:
+                        self.on_wake_turn(chat_id, text)  # type: ignore[operator]
+                    except Exception as exc:  # noqa: BLE001 — delivery must not kill the watcher
+                        print(f"claude wake-watch: delivery failed for chat {chat_id}: {exc}", flush=True)
+                if stop.is_set():
+                    return
+
     def _terminate_worker(self, chat_id: int) -> bool:
         worker = self._workers.pop(chat_id, None)
         if worker is None:
@@ -882,7 +1092,7 @@ def build_backends_from_env() -> dict[str, object]:
                 codex_bin=os.environ.get("AGENT_GATEWAY_CODEX_BIN", "codex"),
                 model=os.environ.get("AGENT_GATEWAY_CODEX_MODEL", os.environ.get("CODEX_MODEL", "gpt-5.5")),
                 sandbox=os.environ.get("AGENT_GATEWAY_CODEX_SANDBOX", "workspace-write"),
-                timeout_sec=int(os.environ.get("AGENT_GATEWAY_TIMEOUT", "900")),
+                timeout_sec=int(os.environ.get("AGENT_GATEWAY_TIMEOUT", "1800")),
                 effort=os.environ.get("AGENT_GATEWAY_CODEX_EFFORT", os.environ.get("CODEX_REASONING_EFFORT", "medium")),
                 max_session_turns=int(os.environ.get("AGENT_GATEWAY_CODEX_MAX_SESSION_TURNS", "8")),
             )
@@ -891,7 +1101,7 @@ def build_backends_from_env() -> dict[str, object]:
                 codex_bin=os.environ.get("AGENT_GATEWAY_CODEX_BIN", "codex"),
                 model=os.environ.get("AGENT_GATEWAY_CODEX_MODEL", os.environ.get("CODEX_MODEL", "gpt-5.5")),
                 sandbox=os.environ.get("AGENT_GATEWAY_CODEX_SANDBOX", "workspace-write"),
-                timeout_sec=int(os.environ.get("AGENT_GATEWAY_TIMEOUT", "900")),
+                timeout_sec=int(os.environ.get("AGENT_GATEWAY_TIMEOUT", "1800")),
                 effort=os.environ.get("AGENT_GATEWAY_CODEX_EFFORT", os.environ.get("CODEX_REASONING_EFFORT", "medium")),
                 max_session_turns=int(os.environ.get("AGENT_GATEWAY_CODEX_MAX_SESSION_TURNS", "8")),
             )
@@ -902,7 +1112,7 @@ def build_backends_from_env() -> dict[str, object]:
             fallback_model=os.environ.get("AGENT_GATEWAY_CLAUDE_FALLBACK_MODEL", os.environ.get("CLAUDE_FALLBACK_MODEL", "")),
             permission_mode=os.environ.get("AGENT_GATEWAY_CLAUDE_PERMISSION_MODE", "dontAsk"),  # works as root; see ClaudePrintBackend
             allowed_tools=os.environ.get("AGENT_GATEWAY_CLAUDE_ALLOWED_TOOLS", os.environ.get("CLAUDE_ALLOWED_TOOLS", "Read,Edit,Write,Bash,Glob,Grep")),
-            timeout_sec=int(os.environ.get("AGENT_GATEWAY_TIMEOUT", "900")),
+            timeout_sec=int(os.environ.get("AGENT_GATEWAY_TIMEOUT", "1800")),
             thinking_tokens=int(os.environ.get("AGENT_GATEWAY_CLAUDE_THINKING_TOKENS", os.environ.get("MAX_THINKING_TOKENS", "4000") or "0")),
             max_session_turns=int(os.environ.get("AGENT_GATEWAY_CLAUDE_MAX_SESSION_TURNS", "8")),
         )
@@ -1048,6 +1258,55 @@ def _normalize_codex_effort(value: str) -> str:
     aliases = {"med": "medium", "hi": "high", "x": "xhigh", "xh": "xhigh", "max": "xhigh"}
     effort = aliases.get(effort, effort)
     return effort if effort in {"low", "medium", "high", "xhigh"} else "medium"
+
+
+# Official Claude effort levels (Opus 4.8 / Sonnet 5): low | medium | high | xhigh | max.
+_CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _normalize_claude_effort(value: str) -> str:
+    """Map free-text to an OFFICIAL Claude effort level so the value passed to
+    `claude --effort` is the value shown in the footer. Unknown input → 'high'."""
+    effort = (value or "").strip().lower()
+    aliases = {"med": "medium", "hi": "high", "x": "xhigh", "xhi": "xhigh",
+               "ultra": "max", "maximum": "max"}
+    effort = aliases.get(effort, effort)
+    return effort if effort in _CLAUDE_EFFORT_LEVELS else "high"
+
+
+def _looks_like_non_openai_model(value: str) -> bool:
+    """Catch provider/model overrides that should never be sent to Codex.
+
+    Groq is only used by this gateway for Whisper transcription. If a chat-level
+    `/model` override or env leak points Codex at Groq-hosted model names, the
+    turn may appear to be "answered by Groq" instead of Codex. Keep the guard
+    deliberately narrow and easy to extend.
+    """
+    model = (value or "").strip().lower()
+    if not model:
+        return False
+    if "groq" in model:
+        return True
+    first = model.split("/", 1)[-1]
+    return first.startswith((
+        "llama",
+        "mixtral",
+        "gemma",
+        "qwen",
+        "deepseek",
+        "moonshot",
+        "kimi",
+    ))
+
+
+def _codex_model_or_default(override: str, default: str) -> tuple[str, str]:
+    fallback = default or "gpt-5.5"
+    if _looks_like_non_openai_model(override):
+        return fallback, f"Ignoring non-Codex model override `{override}`; using `{fallback}`."
+    if _looks_like_non_openai_model(fallback):
+        clean = "gpt-5.5"
+        return clean, f"Ignoring non-Codex default model `{fallback}`; using `{clean}`."
+    return (override or fallback), ""
 
 
 def _claude_user_msg(text: str) -> str:

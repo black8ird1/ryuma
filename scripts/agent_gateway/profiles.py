@@ -200,6 +200,9 @@ def _parse_value(value: str) -> str:
 
 def _apply_profile_defaults(values: dict[str, str], *, profile_name: str) -> None:
     backend = values.get("AGENT_GATEWAY_DEFAULT_BACKEND", "").strip()
+    # The bot's own name — the worktree broker namespaces per-profile with this
+    # so parallel bots on one chat never share (or sweep) each other's dirs.
+    values.setdefault("AGENT_GATEWAY_PROFILE_NAME", profile_name)
     values.setdefault("AGENT_GATEWAY_STATE_DIR", str(ROOT / "state" / "agent-gateway" / "runtime" / profile_name))
     # Every bot runs ALL agents and lets you switch live from the bot (/model). The
     # profile's AGENT is only the DEFAULT; FIXED_BACKEND=0 unlocks switching. (users.env

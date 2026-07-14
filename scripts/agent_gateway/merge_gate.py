@@ -68,8 +68,11 @@ class MergeAssessment:
 
     @property
     def landable(self) -> bool:
-        """True when a one-tap land is safe to offer (work exists, base clean)."""
-        return self.needed and not self.dirty
+        """True when a one-tap land is worth offering. A dirty base no longer blocks it:
+        a fast-forward is protected inline by git, and a non-ff merge auto-stashes the
+        base's WIP, merges, then restores it. So if there's work to land, offer it — the
+        land itself reports the rare real conflict and never loses your changes."""
+        return self.needed
 
     def summary(self) -> str:
         if not self.needed:
@@ -143,11 +146,26 @@ class MergeGate:
         assessment = self.assess(branch)
         if not assessment.needed:
             return MergeResult(False, branch, base, message=assessment.reason or "nothing to land")
-        if assessment.dirty:
-            return MergeResult(False, branch, base, message=f"{base} checkout is dirty — commit or stash it before landing")
+        # A FAST-FORWARD only advances the branch pointer and updates the files that
+        # actually changed — and git refuses to overwrite any uncommitted edit you have
+        # to those same files. So a dirty base does NOT block a fast-forward (the common
+        # case): your unrelated WIP rides through untouched. Only a real (non-ff) MERGE
+        # commit needs a clean tree. This is what makes auto-worktree + smart-merge simple.
+        # A non-fast-forward merge commit needs a clean tree. Rather than make the
+        # operator stash by hand, AUTO-STASH their WIP, merge, then restore it. Safe:
+        # if the restore conflicts, the WIP stays recoverable in `git stash` and we say
+        # so — nothing is lost. (A fast-forward needs no stash; git protects it inline.)
+        stashed = False
+        if assessment.dirty and not assessment.fast_forward:
+            st = self._git(["stash", "push", "--include-untracked", "-m", "agent-gateway: auto-stash before land"])
+            if st.code != 0:
+                return MergeResult(False, branch, base, message=f"couldn't auto-stash {base}'s uncommitted work to merge — {_tail(st.out)}. Your work is untouched.")
+            stashed = "No local changes to save" not in st.out
         if self._current_branch() != base:
             checkout = self._git(["checkout", base])
             if checkout.code != 0:
+                if stashed:
+                    self._git(["stash", "pop"])
                 return MergeResult(False, branch, base, message=f"could not checkout {base}: {_tail(checkout.out)}")
         if assessment.fast_forward:
             merged = self._git(["merge", "--ff-only", branch])
@@ -158,10 +176,17 @@ class MergeGate:
             conflicts = tuple(self._git(["diff", "--name-only", "--diff-filter=U"]).out.split())
             if self._git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], allow_fail=True).code == 0:
                 self._git(["merge", "--abort"])
+            if stashed:
+                self._git(["stash", "pop"])  # merge failed → restore the operator's WIP
             note = "conflicts — left for you to resolve" if conflicts else f"merge failed: {_tail(merged.out)}"
             return MergeResult(False, branch, base, conflicts=conflicts, message=note)
         sha = self._git(["rev-parse", "--short", "HEAD"]).out.strip()
-        result = MergeResult(True, branch, base, sha=sha, message=f"landed {branch} → {base} at {sha}")
+        restore = ""
+        if stashed:
+            pop = self._git(["stash", "pop"])
+            if pop.code != 0:
+                restore = " · ⚠ your WIP is safe in `git stash` — it overlapped the merge, pop it manually"
+        result = MergeResult(True, branch, base, sha=sha, message=f"landed {branch} → {base} at {sha}{restore}")
         if push:
             pushed = self._git(["push", remote, base])
             if pushed.code != 0:
@@ -171,11 +196,18 @@ class MergeGate:
 
     # ---- helpers ----
     def _likely_conflict(self, base: str, branch: str) -> bool:
+        # Legacy merge-tree prints "changed in both" for ANY file modified on both
+        # sides — even when the hunks merge cleanly. Treating that as a conflict
+        # signal made smart-merge decline almost every parallel-session branch
+        # (NOW.md/docs are touched by everyone), so clean work piled up behind
+        # taps the operator never saw (2026-07-02). Only real conflict markers
+        # in the simulated merge count; land() still aborts atomically if this
+        # guesses wrong, so a false negative costs nothing.
         merge_base = self._git(["merge-base", base, branch]).out.strip()
         if not merge_base:
             return False
         out = self._git(["merge-tree", merge_base, base, branch]).out
-        return "<<<<<<<" in out or "changed in both" in out
+        return "<<<<<<<" in out
 
     def _branch_exists(self, branch: str) -> bool:
         return self._git(["rev-parse", "--verify", "--quiet", branch], allow_fail=True).code == 0
