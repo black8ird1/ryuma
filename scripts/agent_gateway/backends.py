@@ -660,7 +660,7 @@ class ClaudePrintBackend:
             voice=True,
             write_access=True,
             compact_final=False,
-            model_suggestions=("claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"),
+            model_suggestions=("claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"),
             effort_suggestions=("low", "medium", "high", "xhigh", "max"),
         )
 
