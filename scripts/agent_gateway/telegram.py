@@ -48,7 +48,7 @@ from .core import Attachment
 from .formatting import md_to_html, split_message
 from .hooks import load_hook
 from .livestore import LiveStore, bot_id_from_token
-from .media import AlbumBuffer, attachment_for, extract_media, outbound_image_paths, save_path, transcribe, voice_enabled
+from .media import BOT_API_DOWNLOAD_CAP, AlbumBuffer, attachment_for, extract_media, outbound_image_paths, save_path, transcribe, voice_enabled
 from .merge_gate import MergeGate
 from .post_turn import PostTurnRunner, extract_post_turn_request
 from .project import brand_emoji, brand_name
@@ -625,6 +625,14 @@ class TelegramGatewayApp:
         transcript = ""
         now_ms = int(time.time() * 1000)
         for index, ref in enumerate(refs):
+            if ref.file_size > BOT_API_DOWNLOAD_CAP:
+                mb = ref.file_size / (1024 * 1024)
+                self.client.send(
+                    chat_id,
+                    f"That file is {mb:.1f}MB — Telegram bots can only download up to 20MB. "
+                    "Trim or compress it and resend.",
+                )
+                continue
             try:
                 remote = self.client.file_path(ref.file_id)
                 dest = save_path(chat_id, ref, now_ms + index)

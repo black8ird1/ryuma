@@ -154,9 +154,24 @@ start_profile() {
   fi
 }
 
+# Expand "--all" (or "all") to every profile file present, so adding a bot is
+# just: drop <name>.env in profiles/, then `agent_gateway_start.sh --all`. No
+# hand-kept bot list. The shared users.env is config, not a bot, so it's skipped.
+discover_profiles() {
+  local f base
+  for f in "$ROOT"/state/agent-gateway/profiles/*.env; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f" .env)"
+    [ "$base" = "users" ] && continue
+    printf '%s\n' "$base"
+  done
+}
+
 if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   shift
-  if [ "$#" -eq 0 ]; then
+  if [ "${1:-}" = "--all" ] || [ "${1:-}" = "all" ]; then
+    set -- $(discover_profiles)
+  elif [ "$#" -eq 0 ]; then
     set -- codex claude mock
   fi
   for profile in "$@"; do
@@ -165,7 +180,9 @@ if [ "${1:-}" = "--status" ] || [ "${1:-}" = "status" ]; then
   exit 0
 fi
 
-if [ "$#" -eq 0 ]; then
+if [ "${1:-}" = "--all" ] || [ "${1:-}" = "all" ]; then
+  set -- $(discover_profiles)
+elif [ "$#" -eq 0 ]; then
   set -- codex claude
 fi
 

@@ -102,9 +102,14 @@ def tmp_dir() -> Path:
 @dataclass(frozen=True)
 class MediaRef:
     file_id: str
-    kind: str  # "image" | "voice"
+    kind: str  # "image" | "voice" | "video"
     suffix: str
     caption: str = ""
+    file_size: int = 0  # bytes as reported by Telegram; 0 = unknown
+
+
+# Bot API getFile refuses files over 20MB — surface that instead of a cryptic fetch error.
+BOT_API_DOWNLOAD_CAP = 20 * 1024 * 1024
 
 
 def extract_media(msg: dict[str, Any]) -> list[MediaRef]:
@@ -117,10 +122,17 @@ def extract_media(msg: dict[str, Any]) -> list[MediaRef]:
         if largest.get("file_id"):
             refs.append(MediaRef(str(largest["file_id"]), "image", ".jpg", caption))
     doc = msg.get("document")
-    if isinstance(doc, dict) and str(doc.get("mime_type") or "").lower().startswith("image/") and doc.get("file_id"):
+    if isinstance(doc, dict) and doc.get("file_id"):
+        mime = str(doc.get("mime_type") or "").lower()
         name = str(doc.get("file_name") or "")
-        suffix = "." + name.rsplit(".", 1)[-1] if "." in name else ".img"
-        refs.append(MediaRef(str(doc["file_id"]), "image", suffix, caption))
+        suffix = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+        if mime.startswith("image/"):
+            refs.append(MediaRef(str(doc["file_id"]), "image", suffix or ".img", caption))
+        elif mime.startswith("video/"):
+            refs.append(MediaRef(str(doc["file_id"]), "video", suffix or ".mp4", caption, int(doc.get("file_size") or 0)))
+    video = msg.get("video") or msg.get("animation") or msg.get("video_note")
+    if isinstance(video, dict) and video.get("file_id"):
+        refs.append(MediaRef(str(video["file_id"]), "video", ".mp4", caption, int(video.get("file_size") or 0)))
     voice = msg.get("voice") or msg.get("audio")
     if isinstance(voice, dict) and voice.get("file_id"):
         refs.append(MediaRef(str(voice["file_id"]), "voice", ".ogg", caption))
