@@ -60,6 +60,33 @@ Setting up an agent CLI (once, on the host):
 | Claude Code | `npm install -g @anthropic-ai/claude-code` | `claude` (or `claude setup-token` for headless) |
 | Codex | `npm install -g @openai/codex` | `codex login` |
 
+## Models — nothing to update on release day
+
+Ryuma reads the model list from the provider's own API instead of a hard-coded
+tuple, caches it on disk, and re-checks it on a timer. A model released this
+morning shows up in `/model` on a bot that has been running for a week — no code
+edit, no redeploy, no restart.
+
+So the default is symbolic:
+
+```env
+CLAUDE_MODEL=latest          # newest Opus/Sonnet/Haiku your account can run
+# CLAUDE_MODEL=latest-sonnet # newest of one family
+# CLAUDE_MODEL=claude-opus-5 # or pin an exact id, forever
+```
+
+If the model is newer than your installed agent CLI, Ryuma says so in the chat,
+answers the turn on the newest model that *does* run, and re-admits the new one by
+itself once you upgrade. Set `AGENT_GATEWAY_CLAUDE_AUTO_UPDATE=1` and it runs the
+upgrade for you instead (off by default — installing software should be your call).
+
+| Env | Default | What it does |
+|-----|---------|--------------|
+| `AGENT_GATEWAY_MODEL_CATALOG_TTL` | `21600` | Seconds between catalog refreshes |
+| `AGENT_GATEWAY_MODEL_PREFER` | `opus,sonnet,haiku` | Families `latest` is allowed to pick |
+| `AGENT_GATEWAY_MODEL_CATALOG_REFRESH` | `1` | `0` = never call the network, seed list only |
+| `AGENT_GATEWAY_CLAUDE_AUTO_UPDATE` | `0` | `1` = upgrade the agent CLI when a model needs it |
+
 ## Requirements
 
 - Python 3.10+

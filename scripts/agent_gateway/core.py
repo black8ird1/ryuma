@@ -140,6 +140,10 @@ class BackendCapabilities:
     write_access: bool = False
     compact_final: bool = True
     model_suggestions: tuple[str, ...] = ()  # common models, shown as /model tap-buttons (free-text still works)
+    # Symbolic models that resolve at turn time (e.g. "latest" → the newest model the
+    # account can run). Shown ABOVE the concrete ids, because picking one is how an
+    # operator stops having to revisit this screen on every release.
+    model_aliases: tuple[str, ...] = ()
     effort_suggestions: tuple[str, ...] = ()  # official effort levels, shown as /effort tap-buttons
 
     def summary(self) -> str:

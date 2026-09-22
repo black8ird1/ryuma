@@ -102,7 +102,7 @@ def tmp_dir() -> Path:
 @dataclass(frozen=True)
 class MediaRef:
     file_id: str
-    kind: str  # "image" | "voice" | "video"
+    kind: str  # "image" | "voice" | "video" | "file"
     suffix: str
     caption: str = ""
     file_size: int = 0  # bytes as reported by Telegram; 0 = unknown
@@ -130,6 +130,15 @@ def extract_media(msg: dict[str, Any]) -> list[MediaRef]:
             refs.append(MediaRef(str(doc["file_id"]), "image", suffix or ".img", caption))
         elif mime.startswith("video/"):
             refs.append(MediaRef(str(doc["file_id"]), "video", suffix or ".mp4", caption, int(doc.get("file_size") or 0)))
+        else:
+            # Any OTHER document — cookies.txt, .json, .srt, logs — is a first-class
+            # turn input too (the backend reads it with its own file tools). Without
+            # this branch a text/* attachment was SILENTLY DROPPED, which is why
+            # sending cookie files "did nothing" (2026-08-19). Preserve the original
+            # filename in the saved path so several files in one send stay
+            # distinguishable (e.g. which cookie belongs to which account).
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "file"
+            refs.append(MediaRef(str(doc["file_id"]), "file", "_" + safe, caption, int(doc.get("file_size") or 0)))
     video = msg.get("video") or msg.get("animation") or msg.get("video_note")
     if isinstance(video, dict) and video.get("file_id"):
         refs.append(MediaRef(str(video["file_id"]), "video", ".mp4", caption, int(video.get("file_size") or 0)))

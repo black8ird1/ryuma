@@ -14,7 +14,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .core import AgentEvent, AgentTurn, BackendCapabilities, Emit, InjectionBuffer, ROOT
+from .models import ModelCatalog, claude_cli_version, cli_too_old, upgrade_claude_cli
 from .project import full_system_prompt
+
+# Offline fallback only. The real list is fetched live (see models.ModelCatalog), so
+# this is what a gateway shows before its first successful fetch — or forever, if it
+# has no network. Newest first; it is a floor, never the ceiling.
+CLAUDE_MODEL_SEED = (
+    "claude-opus-5-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+)
 
 
 def _gateway_prompt(turn: AgentTurn, *, include_system: bool = True) -> str:
@@ -563,7 +578,11 @@ class ClaudePrintBackend:
     """
 
     claude_bin: str = "claude"
-    model: str = os.environ.get("CLAUDE_MODEL", "")
+    # "latest" is the default on purpose: it resolves through the live catalog to the
+    # newest model of a preferred family, so a release day costs nobody an edit, a
+    # redeploy or a restart. A concrete id still pins exactly. Empty = the CLI's own
+    # default, which has wedged the gateway before when that default was gated.
+    model: str = os.environ.get("CLAUDE_MODEL", "latest")
     fallback_model: str = os.environ.get("AGENT_GATEWAY_CLAUDE_FALLBACK_MODEL", os.environ.get("CLAUDE_FALLBACK_MODEL", ""))
     # Effort actually passed to `claude --effort` (and surfaced in the footer, so the
     # displayed level is the level the model runs at — not a value the user guessed).
@@ -619,6 +638,32 @@ class ClaudePrintBackend:
         self.on_wake_turn: object | None = None  # Callable[[int, str], None]
         self._idle_watchers: dict[int, tuple[threading.Thread, threading.Event]] = {}
         self._load_sessions()
+        # LIVE MODEL LIST (2026-09-22). The tap-buttons and the `latest` alias both
+        # read this, so a model released after the process started is usable without
+        # editing code or restarting the bot. The ticker re-fetches on the TTL; every
+        # read is non-blocking and falls back to cache → seed.
+        self._catalog = ModelCatalog(seed=CLAUDE_MODEL_SEED)
+        self._catalog.start_auto_refresh()
+        self._cli_version: str | None = None
+
+    def cli_version(self) -> str:
+        """Local `claude --version`, probed once. It is the quarantine scope: a model
+        the CLI is too old to run is skipped only while THIS version is installed.
+        None vs "" matters — an unreadable version is cached as "" so a missing binary
+        doesn't re-fork a subprocess on every `/model` draw."""
+        if self._cli_version is None:
+            self._cli_version = claude_cli_version(self.claude_bin)
+        return self._cli_version
+
+    def _scope(self) -> str:
+        """Quarantine scope for the READ paths (`/model`, alias resolution). Reading
+        the version spawns the CLI, and with nothing quarantined it cannot change an
+        answer — so stay silent until there is actually something to filter."""
+        return self.cli_version() if self._catalog.has_quarantine() else ""
+
+    def resolve_model(self, requested: str) -> str:
+        """Alias/id → the model id to actually pass to `--model`."""
+        return self._catalog.resolve(requested, scope=self._scope())
 
     def _load_sessions(self) -> None:
         """Restore chat_id->session_id (+ started set) from disk on startup so a
@@ -660,7 +705,11 @@ class ClaudePrintBackend:
             voice=True,
             write_access=True,
             compact_final=False,
-            model_suggestions=("claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"),
+            # Read LIVE on every `/model` draw (see models.ModelCatalog), so the
+            # picker shows a model released this morning without anyone editing a
+            # tuple or restarting the bot. Seed is the offline floor, not the list.
+            model_suggestions=self._catalog.suggestions(scope=self._scope()) or CLAUDE_MODEL_SEED,
+            model_aliases=("latest", "latest-sonnet", "latest-haiku"),
             effort_suggestions=("low", "medium", "high", "xhigh", "max"),
         )
 
@@ -696,7 +745,11 @@ class ClaudePrintBackend:
         # after a one-shot /plan (different sig → respawn back). No session lost.
         permission = "plan" if turn.mode == "plan" else self.permission_mode
         effort = _normalize_claude_effort(turn.effort or self.effort)
-        desired = (turn.model or self.model, _claude_thinking_tokens(turn.effort, self.thinking_tokens), permission, effort)
+        # Resolve the ALIAS here, not at construction: `latest` must mean "newest as
+        # of this turn", so a model released while the process was running is picked
+        # up on the next message instead of at the next restart.
+        model = self.resolve_model(turn.model or self.model)
+        desired = (model, _claude_thinking_tokens(turn.effort, self.thinking_tokens), permission, effort)
         if turn.chat_id in self._workers and self._worker_sig.get(turn.chat_id) != desired:
             self._terminate_worker(turn.chat_id)
             emit(AgentEvent("status", f"Claude reconfigured ({desired[0] or 'default'}); restarting worker.", backend="claude", data={"phase": "session"}))
@@ -704,13 +757,22 @@ class ClaudePrintBackend:
         # Self-heal: if a resumed session was lost server-side ("no conversation
         # found") or its id collided ("already in use"), drop it and retry ONCE
         # from a fresh session, replaying this turn — instead of failing the user.
+        # The third attempt belongs to the OTHER heal: a model the locally installed
+        # CLI is too old to run (below), which costs one retry of its own.
         last_error = ""
-        for attempt in range(2):
+        for attempt in range(3):
             final, drift, error = self._run_once(turn, emit, stop_event, injections)
             if not drift:
                 if error:
                     emit(AgentEvent("error", error, backend="claude"))
                     return ""
+                healed = self._heal_stale_cli(model, final, emit) if attempt < 2 else ""
+                if healed:
+                    model = healed
+                    desired = (model, desired[1], desired[2], desired[3])
+                    self._pending_sig = desired
+                    self._terminate_worker(turn.chat_id)
+                    continue
                 return final
             self._reset_session(turn.chat_id)
             last_error = error
@@ -718,6 +780,49 @@ class ClaudePrintBackend:
                 emit(AgentEvent("status", "Claude session drift — restarting fresh", backend="claude", data={"phase": "session"}))
         emit(AgentEvent("error", last_error or "Claude session could not recover.", backend="claude"))
         return ""
+
+    def _heal_stale_cli(self, model: str, final: str, emit: Emit) -> str:
+        """The turn came back as the CLI refusing a model it is too old to run.
+
+        Returns the model to retry with, or "" if this wasn't that failure (or we
+        couldn't improve on it). Two ways out, in order:
+
+        1. Upgrade the CLI and retry the SAME model — only when the operator opted in
+           with AGENT_GATEWAY_CLAUDE_AUTO_UPDATE=1, because installing software is
+           their call. Replacing the binary is safe for sibling bots: a running
+           process keeps the inode it exec'd, and the next worker picks up the new one.
+        2. Quarantine the model against THIS CLI version and drop to the newest one
+           that runs here. The quarantine is scoped, so upgrading later re-admits it
+           with nothing to undo.
+
+        Either way the operator gets an answer this turn instead of an API error.
+        """
+        versions = cli_too_old(final)
+        if versions is None or not model:
+            return ""
+        have, need = versions
+        detail = f"needs Claude Code {need}+ (have {have})" if need else "is not supported by this Claude Code build"
+        if os.environ.get("AGENT_GATEWAY_CLAUDE_AUTO_UPDATE", "") == "1":
+            emit(AgentEvent("status", f"{model} {detail} — upgrading Claude Code…", backend="claude", data={"phase": "session"}))
+            ok, tail = upgrade_claude_cli()
+            self._cli_version = None  # re-probe: the scope for any future quarantine changed
+            if ok and (not need or self.cli_version() != have):
+                emit(AgentEvent("status", f"Claude Code → {self.cli_version() or 'updated'}; retrying on {model}.", backend="claude", data={"phase": "session"}))
+                return model
+            emit(AgentEvent("status", f"Auto-update did not take ({tail[:120]}); falling back.", backend="claude", data={"phase": "session"}))
+        # Scope from the error itself when it quoted a version: the API names the
+        # build that refused, which is more trustworthy than re-probing (and free).
+        self._catalog.quarantine(model, reason=detail, scope=have or self.cli_version())
+        alternative = self.resolve_model(model)
+        if not alternative or alternative == model:
+            return ""
+        emit(AgentEvent(
+            "status",
+            f"{model} {detail} — answering on {alternative}. Upgrade with: npm i -g @anthropic-ai/claude-code@latest",
+            backend="claude",
+            data={"phase": "session"},
+        ))
+        return alternative
 
     def _run_once(
         self,
@@ -1108,7 +1213,7 @@ def build_backends_from_env() -> dict[str, object]:
     if "claude" in enabled:
         backends["claude"] = ClaudePrintBackend(
             claude_bin=os.environ.get("AGENT_GATEWAY_CLAUDE_BIN", "claude"),
-            model=os.environ.get("AGENT_GATEWAY_CLAUDE_MODEL", os.environ.get("CLAUDE_MODEL", "")),
+            model=os.environ.get("AGENT_GATEWAY_CLAUDE_MODEL", os.environ.get("CLAUDE_MODEL", "latest")),
             fallback_model=os.environ.get("AGENT_GATEWAY_CLAUDE_FALLBACK_MODEL", os.environ.get("CLAUDE_FALLBACK_MODEL", "")),
             permission_mode=os.environ.get("AGENT_GATEWAY_CLAUDE_PERMISSION_MODE", "dontAsk"),  # works as root; see ClaudePrintBackend
             allowed_tools=os.environ.get("AGENT_GATEWAY_CLAUDE_ALLOWED_TOOLS", os.environ.get("CLAUDE_ALLOWED_TOOLS", "Read,Edit,Write,Bash,Glob,Grep")),

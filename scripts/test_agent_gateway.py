@@ -1344,6 +1344,40 @@ class AgentGatewayTests(unittest.TestCase):
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(c) <= 3900 for c in chunks))
 
+    def test_split_never_breaks_a_fenced_block(self):
+        """A cut inside ``` left one chunk with an unterminated fence and the
+        next with no opener, so NEITHER rendered as a copyable <pre> — the
+        founder was reassembling YT descriptions out of two Telegram messages
+        by hand (2026-08-06). Fenced blocks are atomic now."""
+        from agent_gateway.formatting import split_message, md_to_html
+        desc = "\n".join(f"description line {i} padded out to force a real split"
+                         for i in range(90))
+        bundle = ("Pack is built.\n\n"
+                  "```\nZenitsu Scene Pack | Demon Slayer\n```\n\n"
+                  f"```\n{desc}\n```\n\n"
+                  "```\ntag one, tag two, tag three\n```\n\nMy pick is 02.")
+        chunks = split_message(bundle)
+        self.assertGreater(len(chunks), 1)                      # it really did split
+        for c in chunks:
+            self.assertEqual(c.count("```") % 2, 0)             # every fence closed
+            self.assertLessEqual(len(c), 3900)
+        joined = "\n".join(chunks)                              # short blocks survive whole
+        self.assertIn("```\nZenitsu Scene Pack | Demon Slayer\n```", joined)
+        self.assertIn("```\ntag one, tag two, tag three\n```", joined)
+        self.assertGreaterEqual(sum(md_to_html(c).count("<pre>") for c in chunks), 3)
+
+    def test_oversized_fence_splits_into_valid_blocks(self):
+        """A single fenced block bigger than one message still yields N
+        copyable blocks, never a broken one."""
+        from agent_gateway.formatting import split_message, md_to_html
+        big = "```\n" + "\n".join(f"line {i} of a very long block" for i in range(400)) + "\n```"
+        chunks = split_message(big)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertEqual(c.count("```") % 2, 0)
+            self.assertLessEqual(len(c), 3900)
+            self.assertIn("<pre>", md_to_html(c))
+
     def test_card_shows_steering_for_steering_backend(self):
         steer = LiveCard(backend="claude", mode="write", label="Claude Code", steering=True)
         live = steer.render_live()
@@ -1927,6 +1961,104 @@ class AgentSetupTest(unittest.TestCase):
         lines = "\n".join(setup_lines(spec_for("codex")))
         self.assertIn("npm install -g @openai/codex", lines)
         self.assertIn("codex login", lines)
+
+
+class ModelCatalogTests(unittest.TestCase):
+    """The live model catalog — the thing that stops a provider release from being
+    a code edit. Every test here runs OFFLINE: the fetcher is a stub, so a green
+    suite proves the fallbacks, not the network."""
+
+    SEED = ("claude-opus-5", "claude-sonnet-5")
+    # Newest first, exactly as the provider returns it.
+    LIVE = [
+        ("claude-opus-5-5", "2026-09-21T16:24:00Z"),
+        ("claude-fable-5-1", "2026-08-28T00:00:00Z"),
+        ("claude-opus-5", "2026-07-24T00:00:00Z"),
+        ("claude-sonnet-5", "2026-06-29T00:00:00Z"),
+        ("claude-haiku-4-5-20251001", "2025-10-15T00:00:00Z"),
+    ]
+
+    def _catalog(self, *, fetcher=None, tmp=None):
+        from agent_gateway.models import ModelCatalog, ModelInfo
+
+        def live():
+            return [ModelInfo(mid, mid, created) for mid, created in self.LIVE]
+
+        self._tmp = tmp or tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        return ModelCatalog(
+            seed=self.SEED,
+            cache_path=Path(self._tmp.name) / "catalog.json",
+            fetcher=fetcher or live,
+            auto_refresh=False,
+        )
+
+    def test_family_and_alias_parsing(self):
+        from agent_gateway.models import model_family, parse_alias
+
+        self.assertEqual(model_family("claude-opus-5-5"), "opus")
+        self.assertEqual(model_family("gpt-5.6-sol"), "gpt")
+        self.assertEqual(parse_alias("latest"), (True, ""))
+        self.assertEqual(parse_alias("latest-sonnet"), (True, "sonnet"))
+        self.assertEqual(parse_alias("claude-opus-5"), (False, ""))
+
+    def test_latest_tracks_the_newest_coding_model(self):
+        cat = self._catalog()
+        cat.refresh(force=True)
+        # Fable 5.1 is NEWER than Opus 5 but is not a preferred family, so a coding
+        # gateway pinned to `latest` must not drift into it.
+        self.assertEqual(cat.resolve("latest"), "claude-opus-5-5")
+        self.assertEqual(cat.resolve("latest-any"), "claude-opus-5-5")
+        self.assertEqual(cat.resolve("latest-sonnet"), "claude-sonnet-5")
+        self.assertEqual(cat.resolve("latest-fable"), "claude-fable-5-1")
+        self.assertEqual(cat.resolve("claude-opus-5"), "claude-opus-5")  # a pin stays pinned
+
+    def test_quarantine_is_scoped_to_the_cli_version(self):
+        cat = self._catalog()
+        cat.refresh(force=True)
+        cat.quarantine("claude-opus-5-5", reason="needs 2.1.280", scope="2.1.257")
+        # On the old CLI the newest model is skipped — including when pinned by id.
+        self.assertEqual(cat.resolve("latest", scope="2.1.257"), "claude-opus-5")
+        self.assertEqual(cat.resolve("claude-opus-5-5", scope="2.1.257"), "claude-opus-5")
+        # Upgrading the CLI changes the scope, which IS the un-quarantine.
+        self.assertEqual(cat.resolve("latest", scope="2.1.280"), "claude-opus-5-5")
+
+    def test_suggestions_show_one_champion_per_family(self):
+        cat = self._catalog()
+        cat.refresh(force=True)
+        picks = cat.suggestions(limit=4)
+        self.assertEqual(picks[0], "claude-opus-5-5")
+        self.assertIn("claude-sonnet-5", picks)
+        self.assertIn("claude-haiku-4-5-20251001", picks)  # not buried under older Opus
+
+    def test_fetch_failure_falls_back_to_seed_not_empty(self):
+        def boom():
+            raise RuntimeError("no network")
+
+        cat = self._catalog(fetcher=boom)
+        self.assertFalse(cat.refresh(force=True))
+        self.assertEqual(cat.ids(), self.SEED)
+        self.assertEqual(cat.resolve("latest"), "claude-opus-5")
+
+    def test_cache_survives_a_restart(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._catalog(tmp=tmp).refresh(force=True)
+
+        def boom():
+            raise RuntimeError("offline on restart")
+
+        reborn = self._catalog(fetcher=boom, tmp=tmp)
+        self.assertEqual(reborn.resolve("latest"), "claude-opus-5-5")
+
+    def test_cli_too_old_is_recognised_from_the_real_error(self):
+        from agent_gateway.models import cli_too_old
+
+        msg = "API Error: 400 Claude Code 2.1.257 does not support this model; version 2.1.280 or newer is required."
+        self.assertEqual(cli_too_old(msg), ("2.1.257", "2.1.280"))
+        self.assertEqual(cli_too_old('[claude-code:unrecognized_model] {"model":"x"}'), ("", ""))
+        self.assertIsNone(cli_too_old("API Error: 500 overloaded"))
+        self.assertIsNone(cli_too_old(""))
 
 
 if __name__ == "__main__":

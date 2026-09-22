@@ -14,7 +14,7 @@ TELEGRAM_LIMIT = 4096
 CHUNK_SIZE = 3900  # headroom so a chunk + any marker never crosses the hard limit
 
 
-def split_message(text: str, limit: int = CHUNK_SIZE) -> list[str]:
+def _split_plain(text: str, limit: int) -> list[str]:
     """Split on natural boundaries (paragraph > line > word > hard cut)."""
     text = text.rstrip()
     if len(text) <= limit:
@@ -35,6 +35,93 @@ def split_message(text: str, limit: int = CHUNK_SIZE) -> list[str]:
         chunks.append(remaining[:cut].rstrip())
         remaining = remaining[cut:].lstrip()
     return chunks
+
+
+def _split_fence(block: str, limit: int) -> list[str]:
+    """Split one ```fenced block that is itself over the limit, re-opening the
+    fence on every piece so each renders as its own copyable <pre>."""
+    lines = block.split("\n")
+    opener = lines[0] if lines[0].startswith("```") else "```"
+    body = lines[1:]
+    if body and body[-1].strip() == "```":
+        body = body[:-1]
+    out, cur = [], []
+    # -4 for the closing "\n```" we always append.
+    budget = limit - len(opener) - 4
+    size = 0
+    for line in body:
+        if cur and size + len(line) + 1 > budget:
+            out.append(opener + "\n" + "\n".join(cur) + "\n```")
+            cur, size = [], 0
+        cur.append(line)
+        size += len(line) + 1
+    if cur:
+        out.append(opener + "\n" + "\n".join(cur) + "\n```")
+    return out or [block]
+
+
+def split_message(text: str, limit: int = CHUNK_SIZE) -> list[str]:
+    """Split on natural boundaries, NEVER inside a ``` fenced block.
+
+    Why the fence rule (founder, 2026-08-06, third time of asking): the YT
+    bundle we hand over after every pack — title, description, tags — is
+    delivered in fenced blocks so Telegram renders each as a tap-to-copy
+    <pre>. Splitting happens on the RAW markdown before md_to_html() sees it
+    (telegram.py:179), so a cut inside a fence left one chunk with an
+    unterminated ``` and the next with no opener — the _FENCE_RE match fails on
+    both and NEITHER renders as a copy block. The founder was pasting two
+    Telegram messages into Notes and reassembling the description by hand.
+
+    Fenced blocks are therefore atomic: they move to the next chunk whole. A
+    block that is over the limit on its own is split fence-aware, re-opening
+    the fence on each piece, so the worst case is still N copyable blocks and
+    never a broken one.
+    """
+    text = text.rstrip()
+    if len(text) <= limit:
+        return [text] if text else [""]
+
+    # Tokenise into alternating plain / fenced segments. An unterminated fence
+    # at EOF is treated as running to the end, which is what the renderer does.
+    segments: list[tuple[str, str]] = []
+    pos = 0
+    for m in re.finditer(r"```[\w+-]*\n.*?(?:\n```|\Z)", text, re.DOTALL):
+        if m.start() > pos:
+            segments.append(("plain", text[pos:m.start()]))
+        segments.append(("fence", m.group(0)))
+        pos = m.end()
+    if pos < len(text):
+        segments.append(("plain", text[pos:]))
+    if not any(kind == "fence" for kind, _ in segments):
+        return _split_plain(text, limit)
+
+    chunks: list[str] = []
+    cur = ""
+
+    def flush() -> None:
+        nonlocal cur
+        if cur.strip():
+            chunks.append(cur.rstrip())
+        cur = ""
+
+    for kind, seg in segments:
+        if kind == "fence":
+            if len(seg) > limit:
+                flush()
+                chunks.extend(_split_fence(seg, limit))
+                continue
+            if len(cur) + len(seg) + 1 > limit:
+                flush()
+            cur = (cur + "\n" + seg) if cur else seg
+            continue
+        for piece in _split_plain(seg, limit):
+            if not piece:
+                continue
+            if len(cur) + len(piece) + 2 > limit:
+                flush()
+            cur = (cur + "\n\n" + piece) if cur else piece
+    flush()
+    return chunks or [""]
 
 
 _FENCE_RE = re.compile(r"```(?:[\w+-]*)\n?(.*?)```", re.DOTALL)

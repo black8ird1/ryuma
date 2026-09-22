@@ -242,5 +242,3 @@ def run(
     return OnboardResult(profile=profile_name, agent=agent, user_id=user_id, username=username)
 
 
-def _join(items: Iterable[str]) -> str:
-    return ", ".join(items)

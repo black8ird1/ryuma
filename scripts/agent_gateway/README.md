@@ -124,6 +124,33 @@ The next production-grade follow-up is to activate the shared gateway behind a
 separate Telegram token and run a live mock/Codex/Claude shakedown before any
 existing bot path is replaced.
 
+## Model Catalog (no release-day chore)
+
+`models.py` fetches the account's real model list from `GET /v1/models`, caches it
+to `state/agent-gateway/model-catalog.json`, and re-fetches on a TTL ticker. Both
+the `/model` tap-buttons and the `latest` alias read it per use, so a model that
+shipped after the process started is selectable **without restarting the bot**.
+
+- `CLAUDE_MODEL=latest` (the default) — newest of `AGENT_GATEWAY_MODEL_PREFER`
+  (`opus,sonnet,haiku`). Fable is excluded on purpose: it is newer than some Opus
+  releases and is not the coding model. `latest-fable` / `latest-any` opt in.
+- Credential: `ANTHROPIC_API_KEY`, else the `CLAUDE_CODE_OAUTH_TOKEN` the bot
+  already has — the models endpoint accepts it as a bearer token.
+- Never blocks a turn, never returns empty: live list → disk cache → the
+  `CLAUDE_MODEL_SEED` tuple in `backends.py`.
+- **CLI-too-old self-heal.** `claude` refuses a model newer than itself with
+  `400 … does not support this model; version X or newer is required`. That reply
+  is caught, the model is quarantined **against the installed CLI version**, and
+  the turn is retried on the newest model that runs here — so the operator gets an
+  answer, not an API error. Upgrading the CLI changes the scope, which *is* the
+  un-quarantine; there is nothing to clean up. `AGENT_GATEWAY_CLAUDE_AUTO_UPDATE=1`
+  runs the upgrade instead of falling back (opt-in: it installs software as the
+  gateway's user).
+
+`scripts/ninja_bot/config.py` (the older single-purpose Claude cockpit) still
+carries its own hard-coded tier→model map. It is a separate service and was left
+alone.
+
 ## Advanced Raw Env Activation
 
 Profiles are just a small wrapper around the underlying env vars. This is still

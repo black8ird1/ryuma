@@ -377,9 +377,18 @@ class TelegramGatewayApp:
 
     def _show_models(self, chat_id: int, backend: str, message_id=None) -> None:
         obj = self.runtime.backends.get(backend)
-        models = list(getattr(obj.capabilities, "model_suggestions", ()) if obj else ())
+        caps = obj.capabilities if obj else None
+        models = list(getattr(caps, "model_suggestions", ()) if caps else ())
         cur_model = self.runtime.model_for_chat(chat_id)
-        rows = [[{"text": ("✓ " if m == cur_model else "") + m, "callback_data": f"pm:{backend}:{m}"}] for m in models]
+        # Aliases first and labelled with what they resolve to RIGHT NOW, so the
+        # operator can see that "latest" is already the newest model and stop
+        # re-picking one by hand after every release.
+        rows = []
+        for alias in getattr(caps, "model_aliases", ()) if caps else ():
+            resolved = obj.resolve_model(alias) if hasattr(obj, "resolve_model") else ""
+            label = f"{alias} → {resolved}" if resolved and resolved != alias else alias
+            rows.append([{"text": ("✓ " if alias == cur_model else "") + label, "callback_data": f"pm:{backend}:{alias}"}])
+        rows += [[{"text": ("✓ " if m == cur_model else "") + m, "callback_data": f"pm:{backend}:{m}"}] for m in models]
         if len(self.runtime.backend_names()) > 1 and not self.config.fixed_backend:
             rows.append([{"text": "← agents", "callback_data": "pa:"}])
         label = f"{backend} · pick a model:" if models else f"{backend} · type /model <name> (no suggestions)"
