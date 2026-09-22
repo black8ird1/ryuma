@@ -199,9 +199,27 @@ class ModelCatalog:
             self._quarantine = {str(k): v for k, v in (data.get("quarantine") or {}).items() if isinstance(v, dict)}
             self._fetched_at = float(data.get("fetched_at") or 0)
 
+    def _merge_disk_quarantine(self) -> None:
+        """Fold in what other processes have learned. Five bots share one catalog
+        file, so a plain overwrite would let the last writer erase a sibling's
+        finding — and a bot that never tried the bad model would keep offering it.
+        Newest `at` wins per model."""
+        try:
+            disk = json.loads(self._cache_path.read_text()).get("quarantine") or {}
+        except (OSError, ValueError):
+            return
+        with self._lock:
+            for mid, entry in disk.items():
+                if not isinstance(entry, dict):
+                    continue
+                mine = self._quarantine.get(mid)
+                if mine is None or float(entry.get("at") or 0) > float(mine.get("at") or 0):
+                    self._quarantine[mid] = entry
+
     def _save_cache(self) -> None:
         """Atomic write. A truncated catalog would be read back as 'no models' and
         silently downgrade every bot on the box, so never write in place."""
+        self._merge_disk_quarantine()
         with self._lock:
             payload = {
                 "fetched_at": self._fetched_at,
@@ -400,21 +418,37 @@ def cli_too_old(text: str) -> tuple[str, str] | None:
     return None
 
 
-def upgrade_claude_cli(command: str = "") -> tuple[bool, str]:
+def upgrade_claude_cli(command: str = "", claude_bin: str = "claude") -> tuple[bool, str]:
     """Run the CLI's own upgrade. Opt-in (AGENT_GATEWAY_CLAUDE_AUTO_UPDATE=1): this
     installs software as whatever user the gateway runs as, which must be the
     operator's explicit choice, not a default. Safe for running bots — replacing the
     binary on disk does not touch processes that already exec'd it; the next worker
-    picks up the new one."""
-    cmd = command or os.environ.get(
-        "AGENT_GATEWAY_CLAUDE_UPDATE_CMD", "npm install -g @anthropic-ai/claude-code@latest"
-    )
-    try:
-        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-    tail = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
-    return proc.returncode == 0, (tail[-1] if tail else "")
+    picks up the new one.
+
+    `claude update` FIRST, npm second, and the order is load-bearing. A host can
+    carry both installs at once, and the npm entry on PATH delegates to the native
+    one — so `npm -g install @latest` can report success while the binary that
+    actually serves turns stays at the old version. That is precisely how Opus 5.5
+    stayed invisible here on 2026-09-22 after a "successful" npm upgrade. Asking the
+    installed CLI to update itself always hits the copy that runs.
+    """
+    override = command or os.environ.get("AGENT_GATEWAY_CLAUDE_UPDATE_CMD", "")
+    attempts = [override] if override else [
+        f"{claude_bin} update",
+        "npm install -g @anthropic-ai/claude-code@latest",
+    ]
+    last = ""
+    for cmd in attempts:
+        try:
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            continue
+        tail = ((proc.stdout or "") + (proc.stderr or "")).strip().splitlines()
+        last = tail[-1] if tail else ""
+        if proc.returncode == 0:
+            return True, last
+    return False, last
 
 
 def default_catalog(seed: Iterable[str] = ()) -> ModelCatalog:

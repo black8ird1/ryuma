@@ -2056,6 +2056,18 @@ class ModelCatalogTests(unittest.TestCase):
         reborn = self._catalog(fetcher=boom, tmp=tmp)
         self.assertEqual(reborn.resolve("latest"), "claude-opus-5-5")
 
+    def test_quarantine_is_shared_between_bots(self):
+        """Five bots, one catalog file: what one learns the others must honour, and
+        neither may erase the other's finding by saving over it."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bot_a, bot_b = self._catalog(tmp=tmp), self._catalog(tmp=tmp)
+        bot_a.refresh(force=True)
+        bot_a.quarantine("claude-opus-5-5", reason="needs a newer CLI", scope="2.1.278")
+        bot_b.quarantine("claude-fable-5-1", reason="also unusable", scope="2.1.278")
+        self.assertTrue(bot_b.is_quarantined("claude-opus-5-5", scope="2.1.278"))
+        self.assertEqual(bot_b.resolve("latest", scope="2.1.278"), "claude-opus-5")
+
     def test_cli_too_old_is_recognised_from_the_real_error(self):
         from agent_gateway.models import cli_too_old
 

@@ -20,6 +20,11 @@ from .project import full_system_prompt
 # Offline fallback only. The real list is fetched live (see models.ModelCatalog), so
 # this is what a gateway shows before its first successful fetch — or forever, if it
 # has no network. Newest first; it is a floor, never the ceiling.
+# How long a `claude --version` reading is trusted. Short enough that upgrading the
+# CLI takes effect on a running bot without a restart; long enough that a `/model`
+# draw isn't forking the CLI every time.
+CLI_VERSION_TTL = 300.0
+
 CLAUDE_MODEL_SEED = (
     "claude-opus-5-5",
     "claude-fable-5-1",
@@ -645,14 +650,25 @@ class ClaudePrintBackend:
         self._catalog = ModelCatalog(seed=CLAUDE_MODEL_SEED)
         self._catalog.start_auto_refresh()
         self._cli_version: str | None = None
+        self._cli_version_at = 0.0
 
     def cli_version(self) -> str:
-        """Local `claude --version`, probed once. It is the quarantine scope: a model
-        the CLI is too old to run is skipped only while THIS version is installed.
-        None vs "" matters — an unreadable version is cached as "" so a missing binary
-        doesn't re-fork a subprocess on every `/model` draw."""
-        if self._cli_version is None:
+        """Local `claude --version`, probed at most every CLI_VERSION_TTL seconds.
+
+        Caching it FOREVER was wrong (2026-09-22): the box had two Claude installs —
+        an npm one on PATH and a native one the wrapper actually delegates to — and
+        upgrading only the npm copy left the bot on 2.1.278. Once the native install
+        was upgraded the quarantine should have lapsed on its own, but the process
+        had memoised the old version and would have hidden Opus 5.5 until someone
+        restarted it. Re-probing is what makes "upgrade the CLI" the whole fix.
+
+        None vs "" still matters: an unreadable version caches as "", so a missing
+        binary doesn't re-fork a subprocess on every `/model` draw inside the window.
+        """
+        now = time.time()
+        if self._cli_version is None or (now - self._cli_version_at) > CLI_VERSION_TTL:
             self._cli_version = claude_cli_version(self.claude_bin)
+            self._cli_version_at = now
         return self._cli_version
 
     def _scope(self) -> str:
@@ -804,7 +820,7 @@ class ClaudePrintBackend:
         detail = f"needs Claude Code {need}+ (have {have})" if need else "is not supported by this Claude Code build"
         if os.environ.get("AGENT_GATEWAY_CLAUDE_AUTO_UPDATE", "") == "1":
             emit(AgentEvent("status", f"{model} {detail} — upgrading Claude Code…", backend="claude", data={"phase": "session"}))
-            ok, tail = upgrade_claude_cli()
+            ok, tail = upgrade_claude_cli(claude_bin=self.claude_bin)
             self._cli_version = None  # re-probe: the scope for any future quarantine changed
             if ok and (not need or self.cli_version() != have):
                 emit(AgentEvent("status", f"Claude Code → {self.cli_version() or 'updated'}; retrying on {model}.", backend="claude", data={"phase": "session"}))
