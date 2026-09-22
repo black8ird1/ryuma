@@ -864,8 +864,13 @@ class AgentGatewayTests(unittest.TestCase):
         voice = extract_media({"voice": {"file_id": "v"}})
         self.assertEqual(voice[0].kind, "voice")
         self.assertEqual(extract_media({"text": "hi"}), [])
-        # non-image documents are ignored
-        self.assertEqual(extract_media({"document": {"file_id": "z", "mime_type": "application/pdf"}}), [])
+        # Any OTHER document is a first-class turn input (5d52dfc8) — a text/* or
+        # .json attachment used to be silently dropped, which is the whole reason
+        # sending a cookies file "did nothing". The backend reads it with its own
+        # file tools, so the gateway's job is only to save it under a usable name.
+        pdf = extract_media({"document": {"file_id": "z", "mime_type": "application/pdf", "file_name": "spec.pdf"}})
+        self.assertEqual(pdf[0].kind, "file")
+        self.assertEqual(pdf[0].suffix, "_spec.pdf")
 
     def test_handle_media_downloads_and_submits_attachment(self):
         runtime = GatewayRuntime({"mock": MockBackend()}, default_backend="mock")
